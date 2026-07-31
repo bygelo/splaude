@@ -10,6 +10,8 @@
 	<string>com.bygelo.splaude</string>
 	<key>CFBundleExecutable</key>
 	<string>splaude</string>
+	<key>CFBundleIconFile</key>
+	<string>splaude</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>

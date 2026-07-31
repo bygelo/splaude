@@ -274,116 +274,111 @@ private struct SettingView: View {
         .help(detail)
     }
 }
-
 // MARK: - Hotkey recorder
 
-/// Captures the next key combination pressed. AppKit rather than SwiftUI because
-/// it needs raw keyDown with modifier flags, before any text interpretation.
-private struct HotkeyRecorder: NSViewRepresentable {
+/// Captures the next key combination pressed.
+///
+/// Events arrive through a local monitor rather than `keyDown` on a first
+/// responder. An NSView hosted in a SwiftUI `Form` is given neither a reliable
+/// clickable frame — its intrinsic width is `noIntrinsicMetric`, which can
+/// resolve to zero — nor a dependable place in the responder chain, so the
+/// AppKit version of this control could sit there accepting nothing at all. A
+/// monitor sees events before dispatch and is independent of both.
+private struct HotkeyRecorder: View {
 
     @Binding var label: String
 
-    func makeNSView(context: Context) -> RecorderView {
-        let view = RecorderView()
-        view.onRecord = { code, modifier in
-            Setting.hotkeyCode = code
-            Setting.hotkeyModifier = modifier
-            label = Hotkey.describe()
+    @State private var isListening = false
+    @State private var monitor: Any?
+    @State private var holding: UInt32 = 0
+
+    var body: some View {
+        Button(action: toggle) {
+            Text(display)
+                .font(.system(size: 13, weight: .medium))
+                .frame(maxWidth: .infinity, minHeight: 22)
+                .contentShape(Rectangle())
         }
-        return view
+        .buttonStyle(.bordered)
+        .tint(isListening ? Color.accentColor : nil)
+        .help("Click, then press a combination such as ⌥⇧D. Escape cancels.")
+        // A monitor outliving this view would swallow every keystroke in the
+        // app, so it has to come down whenever the view goes away.
+        .onDisappear(perform: stop)
     }
 
-    func updateNSView(_ view: RecorderView, context: Context) {
-        view.label = label
-        view.needsDisplay = true
+    private var display: String {
+        guard isListening else { return label }
+        return holding == 0 ? "Press a shortcut…" : Hotkey.describeModifier(holding) + "…"
     }
 
-    final class RecorderView: NSView {
+    private func toggle() {
+        isListening ? stop() : start()
+    }
 
-        var onRecord: ((UInt32, UInt32) -> Void)?
-        var label = Hotkey.describe()
-        private var isListening = false
+    private func start() {
+        guard monitor == nil else { return }
+        isListening = true
+        holding = 0
 
-        override var acceptsFirstResponder: Bool { true }
-        override var intrinsicContentSize: NSSize { NSSize(width: NSView.noIntrinsicMetric, height: 28) }
+        // Carbon consumes the bound combo before anything else sees it, so
+        // without dropping the grab the recorder cannot observe the very
+        // shortcut most people want to rebind — it would start a take instead.
+        Hotkey.active?.suspend()
 
-        override func mouseDown(with event: NSEvent) {
-            isListening = true
-            // Carbon eats the bound combo before the responder chain sees it,
-            // so without this the recorder cannot observe the very shortcut a
-            // user is most likely to rebind — it would start a take instead.
-            Hotkey.active?.suspend()
-            window?.makeFirstResponder(self)
-            needsDisplay = true
+        monitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .flagsChanged]) { event in
+            handle(event)
+        }
+    }
+
+    private func stop() {
+        detach()
+        guard isListening else { return }
+        isListening = false
+        holding = 0
+        Hotkey.active?.resume()
+    }
+
+    private func detach() {
+        if let monitor { NSEvent.removeMonitor(monitor) }
+        monitor = nil
+    }
+
+    /// Returns nil to swallow the event: while listening the keys belong to the
+    /// recorder and must not also reach whatever sits behind it.
+    private func handle(_ event: NSEvent) -> NSEvent? {
+        guard isListening else { return event }
+
+        let carbon = Hotkey.carbonModifier(from: event.modifierFlags)
+
+        // Show the combination building up as it is held, so a modifier-only
+        // press looks like progress rather than a dead control.
+        guard event.type != .flagsChanged else {
+            holding = carbon
+            return nil
         }
 
-        /// Every path out of listening has to land here, or the suspend above
-        /// leaves the app with no working hotkey at all.
-        private func stopListening() {
-            guard isListening else { return }
-            isListening = false
-            Hotkey.active?.resume()
-            needsDisplay = true
+        // Escape abandons the recording rather than binding Escape.
+        guard event.keyCode != UInt16(kVK_Escape) else {
+            stop()
+            return nil
         }
 
-        override func resignFirstResponder() -> Bool {
-            stopListening()
-            return super.resignFirstResponder()
+        // A bare key would fire constantly while typing.
+        guard carbon != 0 else {
+            NSSound.beep()
+            return nil
         }
 
-        override func viewDidMoveToWindow() {
-            super.viewDidMoveToWindow()
-            if window == nil { stopListening() }
-        }
+        Setting.hotkeyCode = UInt32(event.keyCode)
+        Setting.hotkeyModifier = carbon
+        label = Hotkey.describe()
 
-        override func keyDown(with event: NSEvent) {
-            guard isListening else { return super.keyDown(with: event) }
-
-            // Escape abandons the recording rather than binding Escape.
-            guard event.keyCode != UInt16(kVK_Escape) else {
-                stopListening()
-                return
-            }
-
-            var carbon: UInt32 = 0
-            if event.modifierFlags.contains(.command) { carbon |= UInt32(cmdKey) }
-            if event.modifierFlags.contains(.option) { carbon |= UInt32(optionKey) }
-            if event.modifierFlags.contains(.control) { carbon |= UInt32(controlKey) }
-            if event.modifierFlags.contains(.shift) { carbon |= UInt32(shiftKey) }
-
-            // A bare key would fire constantly while typing.
-            guard carbon != 0 else { NSSound.beep(); return }
-
-            isListening = false
-            // Writing the setting posts the change notification, which
-            // re-registers the hotkey from scratch — so no resume() here.
-            onRecord?(UInt32(event.keyCode), carbon)
-            needsDisplay = true
-        }
-
-        override func draw(_ dirtyRect: NSRect) {
-            let rounded = NSBezierPath(roundedRect: bounds.insetBy(dx: 1, dy: 1), xRadius: 6, yRadius: 6)
-
-            (isListening ? NSColor.controlAccentColor.withAlphaComponent(0.15) : NSColor.controlColor).setFill()
-            rounded.fill()
-
-            (isListening ? NSColor.controlAccentColor : NSColor.separatorColor).setStroke()
-            rounded.lineWidth = 1
-            rounded.stroke()
-
-            let text = isListening ? "Press a shortcut…" : label
-            let style = NSMutableParagraphStyle()
-            style.alignment = .center
-
-            let attribute: [NSAttributedString.Key: Any] = [
-                .font: NSFont.systemFont(ofSize: 13, weight: .medium),
-                .foregroundColor: isListening ? NSColor.controlAccentColor : NSColor.labelColor,
-                .paragraphStyle: style,
-            ]
-
-            let size = (text as NSString).size(withAttributes: attribute)
-            let rect = NSRect(x: 0, y: bounds.midY - size.height / 2, width: bounds.width, height: size.height)
-            (text as NSString).draw(in: rect, withAttributes: attribute)
-        }
+        // Writing those settings posts the change notification, which
+        // re-registers the hotkey from scratch — so no resume() here.
+        detach()
+        isListening = false
+        holding = 0
+        return nil
     }
 }

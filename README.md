@@ -28,7 +28,12 @@ this machine.
 make run        # build, install to /Applications, relaunch — use this one
 make check      # credential + permission diagnostic, no UI
 make            # build + assemble build/splaude.app only
+make icon       # regenerate Resource/splaude.icns (only when the mark changes)
 ```
+
+`Resource/splaude.icns` is committed, so a normal build never needs `make icon`.
+It re-renders the mark from `Script/makeicon.swift` at every size an `.icns`
+carries; `make icon TINT=E8763A` changes the colour.
 
 `make run` quits any running copy *before* replacing the bundle and re-registers
 it afterwards. Swapping the app out from under itself leaves LaunchServices with

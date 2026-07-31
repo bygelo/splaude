@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="Asset/banner.png" alt="splaude — push-to-talk dictation for macOS" width="100%">
+</p>
+
 # splaude
 
 Menu bar dictation for macOS. Hold a hotkey, talk, release — the text lands at
@@ -33,7 +37,8 @@ make icon       # regenerate Resource/splaude.icns (only when the mark changes)
 
 `Resource/splaude.icns` is committed, so a normal build never needs `make icon`.
 It re-renders the mark from `Script/makeicon.swift` at every size an `.icns`
-carries; `make icon TINT=E8763A` changes the colour.
+carries; `make icon TINT=E8763A` changes the colour. `Script/makebanner.swift`
+renders `Asset/banner.png` the same way.
 
 `make run` quits any running copy *before* replacing the bundle and re-registers
 it afterwards. Swapping the app out from under itself leaves LaunchServices with

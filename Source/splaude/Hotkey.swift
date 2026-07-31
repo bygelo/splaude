@@ -112,13 +112,28 @@ final class Hotkey {
     /// Human-readable form of the configured combo, for the menu.
     static func describe(keyCode: UInt32 = Setting.hotkeyCode,
                          modifier: UInt32 = Setting.hotkeyModifier) -> String {
+        describeModifier(modifier) + name(for: keyCode)
+    }
+
+    /// Modifier glyphs alone, in the order macOS renders them. Split out so the
+    /// recorder can show what is held before a key lands.
+    static func describeModifier(_ modifier: UInt32) -> String {
         var label = ""
         if modifier & UInt32(controlKey) != 0 { label += "⌃" }
         if modifier & UInt32(optionKey) != 0 { label += "⌥" }
         if modifier & UInt32(shiftKey) != 0 { label += "⇧" }
         if modifier & UInt32(cmdKey) != 0 { label += "⌘" }
+        return label
+    }
 
-        return label + name(for: keyCode)
+    /// AppKit flags to the Carbon mask `RegisterEventHotKey` expects.
+    static func carbonModifier(from flags: NSEvent.ModifierFlags) -> UInt32 {
+        var carbon: UInt32 = 0
+        if flags.contains(.control) { carbon |= UInt32(controlKey) }
+        if flags.contains(.option) { carbon |= UInt32(optionKey) }
+        if flags.contains(.shift) { carbon |= UInt32(shiftKey) }
+        if flags.contains(.command) { carbon |= UInt32(cmdKey) }
+        return carbon
     }
 
     /// Named keys first, then the live keyboard layout for everything else —

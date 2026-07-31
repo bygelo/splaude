@@ -81,6 +81,15 @@ enum Setting {
         set { write(newValue, "guardFocus") }
     }
 
+    /// Pin a take to the field it started in, rather than following focus.
+    ///
+    /// Off means keystrokes go wherever focus is when they are posted, so
+    /// changing window mid-sentence splits a dictation across both.
+    static var anchorInput: Bool {
+        get { store.object(forKey: "anchorInput") as? Bool ?? true }
+        set { write(newValue, "anchorInput") }
+    }
+
     // MARK: - Interface
 
     static var showFloatingButton: Bool {

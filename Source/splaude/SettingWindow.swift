@@ -38,6 +38,7 @@ private final class SettingModel: ObservableObject {
 
     @Published var liveTyping = Setting.liveTyping { didSet { Setting.liveTyping = liveTyping } }
     @Published var guardFocus = Setting.guardFocus { didSet { Setting.guardFocus = guardFocus } }
+    @Published var anchorInput = Setting.anchorInput { didSet { Setting.anchorInput = anchorInput } }
     @Published var typingInterval = Double(Setting.typingInterval) { didSet { Setting.typingInterval = Int(typingInterval) } }
     @Published var language = Setting.language { didSet { Setting.language = language } }
     @Published var useBuiltinKeyterm = Setting.useBuiltinKeyterm { didSet { Setting.useBuiltinKeyterm = useBuiltinKeyterm } }
@@ -93,6 +94,13 @@ private struct SettingView: View {
             Section {
                 Toggle("Only type into text fields", isOn: $model.guardFocus)
                 Text("Live typing emits backspaces. This refuses to send them into surfaces that are not text — file lists, tables, canvases.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section {
+                Toggle("Keep dictation in the field it started in", isOn: $model.anchorInput)
+                Text("Text belongs to the field you were in when you started talking. Switch window mid-sentence and dictation pauses rather than following you, then resumes where it began. Off lets keystrokes land wherever focus happens to be.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

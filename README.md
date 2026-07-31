@@ -98,6 +98,23 @@ safe:
   surface — a file list, a table, an image — live typing is refused and the
   take falls back to a single paste at the end. Backspaces sent into a file
   browser are not a bug worth risking.
+- **The take is pinned to the field it started in.** Synthetic keystrokes go
+  wherever focus is at the instant they are posted, so changing window
+  mid-sentence would spray the rest of a dictation — backspaces included — into
+  whatever you switched to. `FocusAnchor` records the field when you start
+  talking; if focus leaves, typing pauses rather than following you, and
+  resumes where it began when you come back.
+
+A paused take loses nothing. `LiveTyper` keeps its own record of what it
+emitted, so the first frame after focus returns diffs against that and types
+the whole gap at once. If the take *ends* while you are still away, the held
+text is written straight into the remembered field through the accessibility
+API; where that is refused — Electron, terminals and most web views do not
+support it — focus is handed back and the text pasted, which is the only
+remaining route.
+
+Turn it off under Dictation to get the older behaviour, where keystrokes follow
+focus wherever it goes.
 
 Synthetic keystrokes carry a cleared modifier state. Push-to-talk means Option
 is usually physically held while typing happens, and `⌥Delete` deletes a whole
@@ -164,7 +181,7 @@ Menu bar › **Settings…** (`⌘,`), in four tabs:
 
 | Tab | What's there |
 | --- | --- |
-| Dictation | Type-as-I-speak, focus guard, typing speed, language, hotkey recorder |
+| Dictation | Type-as-I-speak, focus guard, input anchoring, typing speed, language, hotkey recorder |
 | Vocabulary | Your keyterms, built-in developer list toggle, live budget meter |
 | General | Floating mic button, start/stop sound, launch at login, log |
 | Status | Accessibility, microphone, credential, and what the handshake said about quota |

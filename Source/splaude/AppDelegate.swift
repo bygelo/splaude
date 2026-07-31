@@ -7,6 +7,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let hotkey = Hotkey()
     private var floating: FloatingMic?
 
+    /// Where the current take's text belongs. Nil when anchoring is off.
+    private var anchor: FocusAnchor?
+    /// Drift is reported once per take; a status update per frame would thrash.
+    private var hasNotedDrift = false
+
     private var backend: (any SpeechBackend)?
     private var transcript = TranscriptBuffer()
     private let typer = LiveTyper()
@@ -140,7 +145,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let focus = FocusProbe.current()
         let focusAllows = Setting.guardFocus ? focus.acceptsTyping : true
         isTypingLive = Setting.liveTyping && TextInserter.isTrusted && focusAllows
-        Diagnostic.session("record — \(FocusProbe.frontmostApp) / \(focus.label) → \(isTypingLive ? "live typing" : "paste at end")")
+
+        // Remember the field as well as the decision, so the rest of the take
+        // can be held back if the user wanders off mid-sentence.
+        anchor = Setting.anchorInput ? FocusAnchor.capture() : nil
+        hasNotedDrift = false
+
+        Diagnostic.session("record — \(FocusProbe.frontmostApp) / \(focus.label) → \(isTypingLive ? "live typing" : "paste at end")\(anchor == nil ? "" : ", anchored")")
 
         if Setting.liveTyping && !focusAllows {
             status = "\(FocusProbe.frontmostApp) has no text field — will paste at the end"
@@ -190,6 +201,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Delivery
 
+    /// Whether keystrokes posted right now would land where the take started.
+    /// Always true when anchoring is off — that is the follow-focus behaviour.
+    private var canTypeNow: Bool {
+        guard let anchor else { return true }
+        return anchor.holdsFocus
+    }
+
+    private func noteDrift() {
+        guard !hasNotedDrift, let anchor else { return }
+        hasNotedDrift = true
+        Diagnostic.log("anchor", "focus left \(anchor.appName) — holding text until it returns")
+        status = "Paused — waiting for \(anchor.appName)"
+        buildMenu()
+    }
+
     private func deliver(_ text: String) {
         guard !text.isEmpty else { return }
 
@@ -203,6 +229,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             status = "Not allowed to paste — text is on your clipboard"
             buildMenu()
             promptForAccessibility()
+            return
+        }
+
+        // A take that ended somewhere else still belongs to the field it began
+        // in, so route it there rather than pasting into whatever is in front.
+        if let anchor, !anchor.holdsFocus {
+            if anchor.insertDirectly(text) {
+                Diagnostic.log("insert", "wrote \(text.count) chars into \(anchor.appName) directly")
+                status = "Inserted into \(anchor.appName)"
+                buildMenu()
+                return
+            }
+
+            // No accessibility write available — Electron, terminals and web
+            // views mostly refuse it. Pasting is the only route left, and a
+            // paste goes to the front, so focus has to be handed back first.
+            Diagnostic.log("insert", "\(anchor.appName) refused a direct write — returning focus to paste")
+            anchor.reactivate()
+            let pending = text
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                TextInserter.insert(pending)
+            }
             return
         }
 
@@ -385,6 +433,17 @@ extension AppDelegate: SpeechBackendDelegate {
             // Live mode reconciles on every frame, interim included — that is
             // what makes words appear as you speak and correct themselves.
             if self.isTypingLive {
+                // Holding back is the whole point of the anchor: keystrokes go
+                // wherever focus is when posted, so typing on regardless would
+                // scatter the sentence — and its backspaces — into whatever the
+                // user switched to. Nothing is lost by waiting. The typer keeps
+                // its own record of what it emitted, so when focus comes back
+                // the next frame diffs against that and types the whole gap.
+                guard self.canTypeNow else {
+                    self.noteDrift()
+                    return
+                }
+
                 self.typer.update(to: display)
                 if isFinal { self.typer.lock() }
                 return
@@ -421,14 +480,40 @@ extension AppDelegate: SpeechBackendDelegate {
             let wordCount = self.transcript.committed.split(separator: " ").count
 
             if self.isTypingLive {
-                // Already on screen, typed as it was spoken.
+                // Usually already on screen, typed as it was spoken — but
+                // anything held back while focus was away never got there, and
+                // ending the take is the last chance to place it.
+                let onScreen = self.typer.text
+                let spoken = self.transcript.committed
+
+                let held: String
+                if spoken.hasPrefix(onScreen) {
+                    held = String(spoken.dropFirst(onScreen.count))
+                } else {
+                    // A revision rewrote text the typer had already emitted, so
+                    // the two no longer line up and any remainder computed from
+                    // them would duplicate words. Leave it alone.
+                    held = ""
+                    if onScreen != spoken {
+                        Diagnostic.log("anchor", "typed text diverged from transcript — nothing recovered")
+                    }
+                }
+
                 self.isTypingLive = false
                 self.typer.reset()
+
+                if !held.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    Diagnostic.log("anchor", "delivering \(held.count) chars held while focus was away")
+                    self.deliver(held)
+                }
             } else {
                 let pending = self.undelivered
                 self.undelivered = ""
                 if !pending.isEmpty { self.deliver(pending) }
             }
+
+            self.anchor = nil
+            self.hasNotedDrift = false
 
             if ["Finishing…", "Listening", "Connecting…"].contains(self.status) {
                 self.status = wordCount == 0 ? "Idle" : "\(wordCount) words"

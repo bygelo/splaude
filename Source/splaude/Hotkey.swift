@@ -126,6 +126,20 @@ final class Hotkey {
         return label
     }
 
+    /// Keys safe to bind on their own.
+    ///
+    /// A bare letter or digit would fire every time it is typed anywhere, so
+    /// those need a modifier. Function keys type nothing, so demanding one of
+    /// them is a restriction with no purpose behind it.
+    static func allowsBareBinding(keyCode: UInt32) -> Bool {
+        let standalone: Set<Int> = [
+            kVK_F1, kVK_F2, kVK_F3, kVK_F4, kVK_F5, kVK_F6, kVK_F7, kVK_F8,
+            kVK_F9, kVK_F10, kVK_F11, kVK_F12, kVK_F13, kVK_F14, kVK_F15,
+            kVK_F16, kVK_F17, kVK_F18, kVK_F19, kVK_F20,
+        ]
+        return standalone.contains(Int(keyCode))
+    }
+
     /// AppKit flags to the Carbon mask `RegisterEventHotKey` expects.
     static func carbonModifier(from flags: NSEvent.ModifierFlags) -> UInt32 {
         var carbon: UInt32 = 0
@@ -150,6 +164,11 @@ final class Hotkey {
             kVK_F1: "F1", kVK_F2: "F2", kVK_F3: "F3", kVK_F4: "F4",
             kVK_F5: "F5", kVK_F6: "F6", kVK_F7: "F7", kVK_F8: "F8",
             kVK_F9: "F9", kVK_F10: "F10", kVK_F11: "F11", kVK_F12: "F12",
+            // F13 upward have no printable form, so the layout lookup below
+            // yields nothing for them — they have to be named here or a
+            // binding renders as a lone modifier.
+            kVK_F13: "F13", kVK_F14: "F14", kVK_F15: "F15", kVK_F16: "F16",
+            kVK_F17: "F17", kVK_F18: "F18", kVK_F19: "F19", kVK_F20: "F20",
         ]
         if let label = named[Int(keyCode)] { return label }
 
@@ -171,6 +190,13 @@ final class Hotkey {
         }
 
         guard status == noErr, length > 0 else { return "key \(keyCode)" }
-        return String(utf16CodeUnits: character, count: length).uppercased()
+
+        // Non-printing keys translate to control characters or nothing at all;
+        // either renders as a blank label, which reads as a broken binding.
+        let translated = String(utf16CodeUnits: character, count: length)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .filter { !$0.unicodeScalars.contains { CharacterSet.controlCharacters.contains($0) } }
+
+        return translated.isEmpty ? "key \(keyCode)" : translated.uppercased()
     }
 }

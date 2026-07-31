@@ -53,6 +53,18 @@ enum TokenStore {
     /// grant was invalidated by a rebuild. Hold it for the session instead.
     private static var cached: Credential?
     private static let lock = NSLock()
+    private static var lastRead: Date?
+
+    /// How long to sit on an expired copy before going back to the Keychain.
+    ///
+    /// The cache is skipped once a token is past expiry so a refresh gets
+    /// picked up — but without a floor here, an expired credential that nobody
+    /// is refreshing means a Keychain hit, and possibly an authorization
+    /// prompt, on every status check.
+    private static let staleRecheck: TimeInterval = 10
+
+    /// How close to expiry counts as worth warning about.
+    private static let warnWindow: TimeInterval = 10 * 60
 
     /// Resolves a usable token, preferring the Keychain.
     ///
@@ -63,8 +75,15 @@ enum TokenStore {
         lock.lock()
         defer { lock.unlock() }
 
-        if let cached, !cached.isExpired { return cached }
+        if let cached {
+            if !cached.isExpired { return cached }
+            // Expired, but re-reading on every call would hammer the Keychain.
+            if let lastRead, Date().timeIntervalSince(lastRead) < staleRecheck {
+                return cached
+            }
+        }
 
+        lastRead = Date()
         var firstFailure: Error?
 
         for attempt in [readKeychain, readFile] {
@@ -79,6 +98,60 @@ enum TokenStore {
         }
 
         throw firstFailure ?? TokenError.notFound
+    }
+
+    // MARK: - Health
+
+    /// The credential's state, classified for display.
+    ///
+    /// splaude reads this token but never refreshes it — that is Claude Code's
+    /// job, and it only happens while Claude Code runs. Someone who installs a
+    /// dictation app and never thinks about it as a Claude Code accessory can
+    /// therefore find it dead, so the state is worth surfacing before a take
+    /// fails rather than at the moment the hotkey is pressed.
+    enum Health {
+        case usable(until: Date?)
+        case expiringSoon(Date)
+        case expired
+        case missing(String)
+
+        var needsAttention: Bool {
+            if case .usable = self { return false }
+            return true
+        }
+
+        /// One line for the menu bar. Nil when there is nothing to say.
+        var headline: String? {
+            switch self {
+            case .usable:
+                return nil
+            case .expiringSoon(let date):
+                return "Credential expires \(date.formatted(date: .omitted, time: .shortened)) — run `claude` to refresh"
+            case .expired:
+                return "Credential expired — run `claude` in a terminal"
+            case .missing:
+                return "No Claude Code credential — run `claude` and sign in"
+            }
+        }
+    }
+
+    static func health() -> Health {
+        do {
+            return classify(try load())
+        } catch {
+            return .missing(error.localizedDescription)
+        }
+    }
+
+    /// Split from `health()` so the thresholds can be exercised against crafted
+    /// credentials rather than only whatever the Keychain happens to hold.
+    static func classify(_ credential: Credential, now: Date = Date()) -> Health {
+        guard let raw = credential.expiresAt else { return .usable(until: nil) }
+
+        let expiry = Date(timeIntervalSince1970: raw / 1000)
+        if expiry <= now { return .expired }
+        if expiry.timeIntervalSince(now) <= warnWindow { return .expiringSoon(expiry) }
+        return .usable(until: expiry)
     }
 
     /// Drops the cached copy so the next `load()` goes back to the Keychain.

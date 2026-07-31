@@ -1,4 +1,5 @@
 import AppKit
+import Carbon.HIToolbox
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
 
@@ -9,6 +10,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// Where the current take's text belongs. Nil when anchoring is off.
     private var anchor: FocusAnchor?
+    /// Watches for Return while a take runs. Nil when not recording.
+    private var submitMonitor: Any?
     /// Drift is reported once per take; a status update per frame would thrash.
     private var hasNotedDrift = false
 
@@ -150,6 +153,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // can be held back if the user wanders off mid-sentence.
         anchor = Setting.anchorInput ? FocusAnchor.capture() : nil
         hasNotedDrift = false
+        watchForSubmit()
 
         Diagnostic.session("record — \(FocusProbe.frontmostApp) / \(focus.label) → \(isTypingLive ? "live typing" : "paste at end")\(anchor == nil ? "" : ", anchored")")
 
@@ -176,6 +180,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard isRecording else { return }
         isRecording = false
 
+        unwatchSubmit()
         capture.stop()
         status = "Finishing…"
         backend?.finish()
@@ -188,6 +193,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func abort(_ message: String) {
         isRecording = false
+        unwatchSubmit()
         capture.stop()
         backend?.finish()
         backend = nil
@@ -206,6 +212,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var canTypeNow: Bool {
         guard let anchor else { return true }
         return anchor.holdsFocus
+    }
+
+    // MARK: - Submit to finish
+
+    /// Watches for Return so that submitting ends the take.
+    ///
+    /// A *global* monitor deliberately: it observes without consuming, so the
+    /// keystroke still reaches the app and sends the message. Swallowing it
+    /// would mean pressing Return did nothing but stop dictating, which is the
+    /// opposite of what someone hitting Return wants.
+    private func watchForSubmit() {
+        guard Setting.stopOnReturn, submitMonitor == nil else { return }
+
+        submitMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            // LiveTyper posts its characters as a unicode payload on virtual
+            // key 0, so its own output can never look like Return here.
+            let key = Int(event.keyCode)
+            guard key == kVK_Return || key == kVK_ANSI_KeypadEnter else { return }
+
+            DispatchQueue.main.async {
+                guard let self, self.isRecording else { return }
+                Diagnostic.log("submit", "Return pressed — ending the take")
+                self.stopRecording()
+            }
+        }
+    }
+
+    private func unwatchSubmit() {
+        if let submitMonitor { NSEvent.removeMonitor(submitMonitor) }
+        submitMonitor = nil
     }
 
     private func noteDrift() {
@@ -514,6 +550,7 @@ extension AppDelegate: SpeechBackendDelegate {
 
             self.anchor = nil
             self.hasNotedDrift = false
+            self.unwatchSubmit()
 
             if ["Finishing…", "Listening", "Connecting…"].contains(self.status) {
                 self.status = wordCount == 0 ? "Idle" : "\(wordCount) words"

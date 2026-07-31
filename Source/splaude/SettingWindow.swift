@@ -39,6 +39,7 @@ private final class SettingModel: ObservableObject {
     @Published var liveTyping = Setting.liveTyping { didSet { Setting.liveTyping = liveTyping } }
     @Published var guardFocus = Setting.guardFocus { didSet { Setting.guardFocus = guardFocus } }
     @Published var anchorInput = Setting.anchorInput { didSet { Setting.anchorInput = anchorInput } }
+    @Published var stopOnReturn = Setting.stopOnReturn { didSet { Setting.stopOnReturn = stopOnReturn } }
     @Published var typingInterval = Double(Setting.typingInterval) { didSet { Setting.typingInterval = Int(typingInterval) } }
     @Published var language = Setting.language { didSet { Setting.language = language } }
     @Published var useBuiltinKeyterm = Setting.useBuiltinKeyterm { didSet { Setting.useBuiltinKeyterm = useBuiltinKeyterm } }
@@ -94,6 +95,13 @@ private struct SettingView: View {
             Section {
                 Toggle("Only type into text fields", isOn: $model.guardFocus)
                 Text("Live typing emits backspaces. This refuses to send them into surfaces that are not text — file lists, tables, canvases.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section {
+                Toggle("Stop dictating when I press Return", isOn: $model.stopOnReturn)
+                Text("Submitting means you are done talking. Return still sends whatever you were typing into — this only ends the take. Turn it off for prose, where Return is a new paragraph rather than a full stop.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

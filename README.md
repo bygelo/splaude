@@ -4,12 +4,18 @@
 
 # splaude
 
-Menu bar dictation for macOS. Hold a hotkey, talk, release — the text lands at
-your cursor in whatever app you were typing in.
+### Did you know Claude Code ships with transcription?
 
-It streams to the same speech endpoint the Claude Code IDE extension uses for
-its mic button, authenticated with the Claude Code OAuth credential already on
-this machine.
+Neither did I — until a spent weekly limit left the mic button in the IDE
+extension still working. It turns out that button talks to a speech endpoint
+that never touches a Claude model, which is why the limit did not apply.
+
+splaude points a macOS menu bar app at the same endpoint. Hold a hotkey, talk,
+release — the text lands at your cursor in whatever app you were typing in, and
+it appears **as you speak** rather than after you stop.
+
+It authenticates with the Claude Code OAuth credential already on this machine,
+so if you have run `claude` once, there is nothing else to set up.
 
 > **Read this before installing.** That endpoint is undocumented and internal to
 > Anthropic, and splaude is not an Anthropic product — it is a third-party

@@ -1,0 +1,131 @@
+name: Release
+
+# Tag a version to cut a release:
+#   git tag v0.1.0 && git push origin v0.1.0
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to build, without the leading v (e.g. 0.1.0)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    # arm64 image with Xcode 16, which is what Swift 6 needs.
+    runs-on: macos-15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            version="${{ inputs.version }}"
+          else
+            version="${GITHUB_REF_NAME#v}"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "building $version"
+
+      - name: Report toolchain
+        run: swift --version
+
+      # Info.plist carries the version the About box and Finder show, and it is
+      # copied into the bundle by `make`, so it has to be stamped before the
+      # build rather than patched into the product afterwards.
+      - name: Stamp version into Info.plist
+        run: |
+          plist=Resource/Info.plist
+          /usr/libexec/PlistBuddy -c \
+            "Set :CFBundleShortVersionString ${{ steps.version.outputs.version }}" "$plist"
+          /usr/libexec/PlistBuddy -c \
+            "Set :CFBundleVersion ${{ github.run_number }}" "$plist"
+
+      - name: Build bundle
+        run: make bundle
+
+      # No Developer ID is available here, so the Makefile's identity lookup
+      # finds nothing and falls back to ad-hoc. That is fine for distribution
+      # but it is why the release notes tell users to clear quarantine.
+      - name: Verify the bundle is complete
+        run: |
+          app=build/splaude.app
+          test -x "$app/Contents/MacOS/splaude"        || { echo "::error::binary missing"; exit 1; }
+          test -f "$app/Contents/Resources/splaude.icns" || { echo "::error::icon missing"; exit 1; }
+          /usr/libexec/PlistBuddy -c "Print :CFBundleIconFile" "$app/Contents/Info.plist"
+          codesign --verify --deep --strict --verbose=2 "$app"
+
+      # A headless smoke test: --check exercises credential lookup and the
+      # accessibility probe without opening any UI. There is no Claude Code
+      # credential on a runner, so it reports "not found" — the point is that
+      # the binary loads and exits cleanly rather than what it concludes.
+      - name: Smoke test
+        run: |
+          build/splaude.app/Contents/MacOS/splaude --check
+          echo "exit $?"
+
+      # ditto, not zip: an .app is a bundle whose symlinks and extended
+      # attributes a plain zip will quietly flatten.
+      - name: Package
+        id: package
+        run: |
+          name="splaude-${{ steps.version.outputs.version }}.zip"
+          ditto -c -k --sequesterRsrc --keepParent build/splaude.app "$name"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          echo "sha=$(shasum -a 256 "$name" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: Write release notes
+        run: |
+          cat > NOTE.md <<'EOF'
+          Menu bar push-to-talk dictation for macOS.
+
+          ## Install
+
+          1. Unzip and drag **splaude.app** to `/Applications`
+          2. Clear the quarantine flag, then open it:
+
+          ```sh
+          xattr -dr com.apple.quarantine /Applications/splaude.app
+          open /Applications/splaude.app
+          ```
+
+          Step 2 is required. This build is **ad-hoc signed, not notarized** —
+          shipping a notarized build needs a paid Apple Developer account.
+          Without clearing quarantine, Gatekeeper refuses to launch it.
+
+          Because the signature is ad-hoc, its identity changes on every
+          release, so macOS treats each update as a new app: expect to grant
+          Accessibility again after upgrading.
+
+          ## First run
+
+          It needs a signed-in Claude Code install — run `claude` in a terminal
+          once if you have not. Three grants are prompted: Microphone,
+          Accessibility, and Keychain access to the Claude Code credential
+          (choose **Always Allow** so it stops asking).
+
+          Requires macOS 14+ on Apple Silicon.
+
+          ## Verify the download
+
+          EOF
+          {
+            echo '```'
+            echo "${{ steps.package.outputs.sha }}  ${{ steps.package.outputs.name }}"
+            echo '```'
+          } >> NOTE.md
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v${{ steps.version.outputs.version }}" \
+            "${{ steps.package.outputs.name }}" \
+            --title "splaude ${{ steps.version.outputs.version }}" \
+            --notes-file NOTE.md

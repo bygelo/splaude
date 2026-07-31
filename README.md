@@ -20,11 +20,29 @@ this machine.
 > [Caveat](#caveat) for what is actually known, and note that `SpeechBackend`
 > is a three-method protocol — swapping in your own Deepgram key is one file.
 
+## Install
+
+Grab the latest zip from [Releases](https://github.com/bygelo/splaude/releases),
+drag `splaude.app` to `/Applications`, then:
+
+```sh
+xattr -dr com.apple.quarantine /Applications/splaude.app
+open /Applications/splaude.app
+```
+
+That second command is not optional. Releases are **ad-hoc signed, not
+notarized** — notarizing needs a paid Apple Developer account — so Gatekeeper
+refuses to launch the app until the quarantine flag is cleared. For the same
+reason the signature changes on every release, and macOS treats each update as
+a new app, so expect to grant Accessibility again after upgrading.
+
+Building from source avoids both problems if you have a signing identity.
+
 ## Requirement
 
 - macOS 14+, Apple Silicon
-- Xcode command line tools (Swift 6)
 - A signed-in Claude Code install (`claude` in a terminal at least once)
+- To build rather than download: Xcode command line tools (Swift 6)
 
 ## Build
 

@@ -164,6 +164,19 @@ menu carries two probes and the app keeps a log at
 If a paste is refused the text is left on the clipboard, so a missing
 permission costs you a `⌘V` rather than the whole take.
 
+### The credential expires
+
+splaude *reads* the Claude Code OAuth token; it never *refreshes* it. That is
+Claude Code's job, and it only happens while Claude Code runs. The token lasts
+hours, not weeks, so an install that is never opened alongside `claude` will
+eventually find it dead.
+
+Rather than let that surface as a take that mysteriously fails, the menu warns
+before it matters — within ten minutes of expiry, and again once expired — and
+the warning opens a note explaining the fix, with `claude` already on your
+clipboard. Settings › Status shows the exact expiry, and `make check` prints it
+from the command line.
+
 ## Does it spend Claude quota?
 
 No, and the app now shows its work rather than asking you to take that on faith.

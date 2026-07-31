@@ -5,6 +5,7 @@ import AppKit
 if CommandLine.arguments.contains("--check") {
     print("splaude credential check")
     print(TokenStore.describe())
+    print("  health: \(TokenStore.health().headline ?? "usable — nothing to warn about")")
     print("\naccessibility (needed to paste): \(TextInserter.isTrusted ? "granted" : "NOT granted")")
     print("hotkey: \(Hotkey.describe())")
 

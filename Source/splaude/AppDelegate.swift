@@ -12,6 +12,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var anchor: FocusAnchor?
     /// Watches for Return while a take runs. Nil when not recording.
     private var submitMonitor: Any?
+
+    /// Last known credential state, polled so it appears in the menu before a
+    /// take fails rather than at the moment the hotkey is pressed.
+    private var credentialHealth: TokenStore.Health = .usable(until: nil)
+    private var healthTimer: Timer?
     /// Drift is reported once per take; a status update per frame would thrash.
     private var hasNotedDrift = false
 
@@ -55,6 +60,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // interrupted by two system dialogs.
         capture.requestPermission { _ in }
         if !TextInserter.isTrusted { TextInserter.requestTrust() }
+
+        // Same reasoning for the credential: read it now, so the Keychain
+        // prompt lands at launch rather than mid-thought on the first take.
+        refreshCredentialHealth()
+        healthTimer = Timer.scheduledTimer(withTimeInterval: 300, repeats: true) { [weak self] _ in
+            self?.refreshCredentialHealth()
+        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -126,6 +138,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard !credential.isExpired else { throw TokenStore.TokenError.expired }
         } catch {
             abort(error.localizedDescription)
+            // The take just failed on the credential, so the menu should say so
+            // rather than waiting for the next poll.
+            refreshCredentialHealth()
             return
         }
 
@@ -244,6 +259,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         submitMonitor = nil
     }
 
+    // MARK: - Credential health
+
+    /// Reads the credential off the main thread. The Keychain prompt is modal
+    /// and blocks whoever asks, so doing this inline would freeze the menu
+    /// until the dialog is answered.
+    private func refreshCredentialHealth() {
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let health = TokenStore.health()
+            DispatchQueue.main.async {
+                guard let self else { return }
+                let changed = health.headline != self.credentialHealth.headline
+                self.credentialHealth = health
+                if changed {
+                    if let line = health.headline { Diagnostic.log("credential", line) }
+                    self.buildMenu()
+                }
+            }
+        }
+    }
+
     private func noteDrift() {
         guard !hasNotedDrift, let anchor else { return }
         hasNotedDrift = true
@@ -292,6 +327,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         Diagnostic.log("insert", "pasting \(text.count) chars")
         TextInserter.insert(text)
+    }
+
+    /// The fix is a terminal command, so put it on the clipboard rather than
+    /// asking someone to retype it from a menu they just dismissed.
+    @objc private func showCredentialHelp() {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString("claude", forType: .string)
+
+        let alert = NSAlert()
+        alert.messageText = "Claude Code credential needs refreshing"
+        alert.informativeText = """
+            splaude reads the OAuth token Claude Code stores, but it never \
+            refreshes that token — Claude Code does, and only while it runs.
+
+            Run `claude` in a terminal to renew it, then dictate again. The \
+            command is on your clipboard.
+            """
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "OK")
+        alert.addButton(withTitle: "Re-check Now")
+
+        NSApp.activate(ignoringOtherApps: true)
+        if alert.runModal() == .alertSecondButtonReturn {
+            TokenStore.invalidate()
+            refreshCredentialHealth()
+        }
     }
 
     /// Shown at most once per launch — a modal every utterance would be worse
@@ -353,6 +414,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         heading.isEnabled = false
         heading.toolTip = status
         menu.addItem(heading)
+
+        // Above the separator, so a dead credential is the first thing read
+        // rather than something discovered when a take fails.
+        if let warning = credentialHealth.headline {
+            let item = NSMenuItem(title: warning, action: #selector(showCredentialHelp), keyEquivalent: "")
+            item.target = self
+            item.image = NSImage(systemSymbolName: "exclamationmark.triangle.fill",
+                                 accessibilityDescription: nil)
+            item.toolTip = "splaude reads the Claude Code credential but does not refresh it. Running `claude` renews it."
+            menu.addItem(item)
+        }
 
         menu.addItem(.separator())
 

@@ -120,10 +120,14 @@ enum Setting {
         set { write(Int(newValue), "hotkeyCode") }
     }
 
+    /// Presence again, not truthiness: zero is a legitimate value here, meaning
+    /// a function key bound on its own. Treating it as unset silently forced
+    /// Option back on and made bare function keys impossible.
     static var hotkeyModifier: UInt32 {
         get {
-            guard let stored = store.object(forKey: "hotkeyModifier") as? Int,
-                  stored != 0 else { return UInt32(optionKey) }
+            guard let stored = store.object(forKey: "hotkeyModifier") as? Int else {
+                return UInt32(optionKey)
+            }
             return UInt32(stored)
         }
         set { write(Int(newValue), "hotkeyModifier") }

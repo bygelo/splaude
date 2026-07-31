@@ -121,7 +121,10 @@ private struct SettingView: View {
 
             Section("Shortcut") {
                 HotkeyRecorder(label: $hotkeyLabel)
-                Text("Hold to talk, or tap to latch recording on. Press Escape while recording to cancel.")
+                Text("Click, then press the combination you want — a modifier (⌘ ⌥ ⌃ ⇧) plus a key, or a function key on its own. Escape cancels.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Text("Hold the shortcut to talk, or tap it to latch recording on.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -291,6 +294,10 @@ private struct HotkeyRecorder: View {
     @State private var isListening = false
     @State private var monitor: Any?
     @State private var holding: UInt32 = 0
+    /// Shown in place of the prompt after a rejected press. A bare beep left
+    /// people concluding the control was broken rather than that their key
+    /// needed a modifier.
+    @State private var rejection: String?
 
     var body: some View {
         Button(action: toggle) {
@@ -309,7 +316,9 @@ private struct HotkeyRecorder: View {
 
     private var display: String {
         guard isListening else { return label }
-        return holding == 0 ? "Press a shortcut…" : Hotkey.describeModifier(holding) + "…"
+        if let rejection { return rejection }
+        guard holding == 0 else { return Hotkey.describeModifier(holding) + "…" }
+        return "Press ⌘ ⌥ ⌃ or ⇧ with a key…"
     }
 
     private func toggle() {
@@ -320,6 +329,7 @@ private struct HotkeyRecorder: View {
         guard monitor == nil else { return }
         isListening = true
         holding = 0
+        rejection = nil
 
         // Carbon consumes the bound combo before anything else sees it, so
         // without dropping the grab the recorder cannot observe the very
@@ -336,6 +346,7 @@ private struct HotkeyRecorder: View {
         guard isListening else { return }
         isListening = false
         holding = 0
+        rejection = nil
         Hotkey.active?.resume()
     }
 
@@ -355,6 +366,7 @@ private struct HotkeyRecorder: View {
         // press looks like progress rather than a dead control.
         guard event.type != .flagsChanged else {
             holding = carbon
+            if carbon != 0 { rejection = nil }
             return nil
         }
 
@@ -364,11 +376,16 @@ private struct HotkeyRecorder: View {
             return nil
         }
 
-        // A bare key would fire constantly while typing.
-        guard carbon != 0 else {
+        // A bare letter would fire every time it is typed anywhere; a function
+        // key types nothing, so it is fine on its own. Say which it is rather
+        // than beeping — the beep alone read as a broken control.
+        guard carbon != 0 || Hotkey.allowsBareBinding(keyCode: UInt32(event.keyCode)) else {
+            rejection = "Hold ⌘, ⌥, ⌃ or ⇧ too — or use F1–F12"
             NSSound.beep()
             return nil
         }
+
+        rejection = nil
 
         Setting.hotkeyCode = UInt32(event.keyCode)
         Setting.hotkeyModifier = carbon
@@ -379,6 +396,7 @@ private struct HotkeyRecorder: View {
         detach()
         isListening = false
         holding = 0
+        rejection = nil
         return nil
     }
 }

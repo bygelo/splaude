@@ -116,6 +116,13 @@ remaining route.
 Turn it off under Dictation to get the older behaviour, where keystrokes follow
 focus wherever it goes.
 
+**Return ends the take.** Submitting is a statement that you are done talking —
+in a chat box or a search field the words after it would land somewhere you
+cannot see. The watcher is a global monitor, which observes without consuming,
+so Return still sends whatever you were typing into; it only stops the
+dictation. Turn it off under Dictation when writing prose, where Return is a
+new paragraph rather than a full stop.
+
 Synthetic keystrokes carry a cleared modifier state. Push-to-talk means Option
 is usually physically held while typing happens, and `⌥Delete` deletes a whole
 word.

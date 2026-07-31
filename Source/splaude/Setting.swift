@@ -81,6 +81,16 @@ enum Setting {
         set { write(newValue, "guardFocus") }
     }
 
+    /// End the take when Return is pressed.
+    ///
+    /// Submitting is a statement that you are done talking — in a chat box or a
+    /// search field the next words would land somewhere you cannot see. Worth
+    /// turning off when dictating prose, where Return is just a new paragraph.
+    static var stopOnReturn: Bool {
+        get { store.object(forKey: "stopOnReturn") as? Bool ?? true }
+        set { write(newValue, "stopOnReturn") }
+    }
+
     /// Pin a take to the field it started in, rather than following focus.
     ///
     /// Off means keystrokes go wherever focus is when they are posted, so

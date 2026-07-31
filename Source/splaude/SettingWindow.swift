@@ -309,8 +309,31 @@ private struct HotkeyRecorder: NSViewRepresentable {
 
         override func mouseDown(with event: NSEvent) {
             isListening = true
+            // Carbon eats the bound combo before the responder chain sees it,
+            // so without this the recorder cannot observe the very shortcut a
+            // user is most likely to rebind — it would start a take instead.
+            Hotkey.active?.suspend()
             window?.makeFirstResponder(self)
             needsDisplay = true
+        }
+
+        /// Every path out of listening has to land here, or the suspend above
+        /// leaves the app with no working hotkey at all.
+        private func stopListening() {
+            guard isListening else { return }
+            isListening = false
+            Hotkey.active?.resume()
+            needsDisplay = true
+        }
+
+        override func resignFirstResponder() -> Bool {
+            stopListening()
+            return super.resignFirstResponder()
+        }
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            if window == nil { stopListening() }
         }
 
         override func keyDown(with event: NSEvent) {
@@ -318,8 +341,7 @@ private struct HotkeyRecorder: NSViewRepresentable {
 
             // Escape abandons the recording rather than binding Escape.
             guard event.keyCode != UInt16(kVK_Escape) else {
-                isListening = false
-                needsDisplay = true
+                stopListening()
                 return
             }
 
@@ -333,6 +355,8 @@ private struct HotkeyRecorder: NSViewRepresentable {
             guard carbon != 0 else { NSSound.beep(); return }
 
             isListening = false
+            // Writing the setting posts the change notification, which
+            // re-registers the hotkey from scratch — so no resume() here.
             onRecord?(UInt32(event.keyCode), carbon)
             needsDisplay = true
         }

@@ -20,7 +20,7 @@ final class Hotkey {
     private static let holdThreshold: TimeInterval = 0.4
 
     private static let signature = OSType(0x53504C44)  // 'SPLD'
-    private static var active: Hotkey?
+    private(set) static var active: Hotkey?
 
     func register(keyCode: UInt32 = Setting.hotkeyCode,
                   modifier: UInt32 = Setting.hotkeyModifier) -> Bool {
@@ -65,6 +65,28 @@ final class Hotkey {
         if Self.active === self { Self.active = nil }
     }
 
+    /// Drops the Carbon grab while keeping the instance registered as active.
+    ///
+    /// A registered hotkey is consumed before it reaches the responder chain,
+    /// so the shortcut recorder can never observe the combo that is currently
+    /// bound — pressing it just starts a dictation. Suspending for the duration
+    /// of a recording is what makes rebinding the current key possible.
+    func suspend() {
+        guard let reference else { return }
+        UnregisterEventHotKey(reference)
+        self.reference = nil
+    }
+
+    /// Re-takes a grab dropped by `suspend()`. Safe to call when not suspended.
+    @discardableResult
+    func resume() -> Bool {
+        guard reference == nil, handler != nil else { return reference != nil }
+        let identifier = EventHotKeyID(signature: Self.signature, id: 1)
+        return RegisterEventHotKey(Setting.hotkeyCode, Setting.hotkeyModifier,
+                                   identifier, GetApplicationEventTarget(),
+                                   0, &reference) == noErr
+    }
+
     deinit { unregister() }
 
     // MARK: - Dispatch
@@ -96,14 +118,44 @@ final class Hotkey {
         if modifier & UInt32(shiftKey) != 0 { label += "⇧" }
         if modifier & UInt32(cmdKey) != 0 { label += "⌘" }
 
-        switch Int(keyCode) {
-        case kVK_Space: label += "Space"
-        case kVK_ANSI_D: label += "D"
-        case kVK_ANSI_V: label += "V"
-        case kVK_Return: label += "Return"
-        default: label += "key \(keyCode)"
+        return label + name(for: keyCode)
+    }
+
+    /// Named keys first, then the live keyboard layout for everything else —
+    /// a hard-coded handful meant any other binding rendered as "key 40",
+    /// which reads as broken even when the shortcut works.
+    private static func name(for keyCode: UInt32) -> String {
+        let named: [Int: String] = [
+            kVK_Space: "Space", kVK_Return: "Return", kVK_Tab: "Tab",
+            kVK_Delete: "Delete", kVK_ForwardDelete: "⌦", kVK_Escape: "Escape",
+            kVK_LeftArrow: "←", kVK_RightArrow: "→",
+            kVK_UpArrow: "↑", kVK_DownArrow: "↓",
+            kVK_Home: "Home", kVK_End: "End",
+            kVK_PageUp: "Page Up", kVK_PageDown: "Page Down",
+            kVK_F1: "F1", kVK_F2: "F2", kVK_F3: "F3", kVK_F4: "F4",
+            kVK_F5: "F5", kVK_F6: "F6", kVK_F7: "F7", kVK_F8: "F8",
+            kVK_F9: "F9", kVK_F10: "F10", kVK_F11: "F11", kVK_F12: "F12",
+        ]
+        if let label = named[Int(keyCode)] { return label }
+
+        guard let source = TISCopyCurrentKeyboardLayoutInputSource()?.takeRetainedValue(),
+              let pointer = TISGetInputSourceProperty(source, kTISPropertyUnicodeKeyLayoutData)
+        else { return "key \(keyCode)" }
+
+        let data = Unmanaged<CFData>.fromOpaque(pointer).takeUnretainedValue() as Data
+        var deadKey: UInt32 = 0
+        var length = 0
+        var character = [UniChar](repeating: 0, count: 4)
+
+        let status = data.withUnsafeBytes { raw -> OSStatus in
+            guard let layout = raw.baseAddress?.assumingMemoryBound(to: UCKeyboardLayout.self)
+            else { return OSStatus(paramErr) }
+            return UCKeyTranslate(layout, UInt16(keyCode), UInt16(kUCKeyActionDisplay), 0,
+                                  UInt32(LMGetKbdType()), UInt32(kUCKeyTranslateNoDeadKeysBit),
+                                  &deadKey, character.count, &length, &character)
         }
 
-        return label
+        guard status == noErr, length > 0 else { return "key \(keyCode)" }
+        return String(utf16CodeUnits: character, count: length).uppercased()
     }
 }

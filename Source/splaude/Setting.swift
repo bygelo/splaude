@@ -108,18 +108,23 @@ enum Setting {
 
     // MARK: - Hotkey
 
+    /// Presence, not truthiness: `kVK_ANSI_A` is keycode 0, so a `> 0` test
+    /// would silently bounce anyone who bound ⌥A back to the default.
     static var hotkeyCode: UInt32 {
         get {
-            let stored = store.integer(forKey: "hotkeyCode")
-            return stored > 0 ? UInt32(stored) : UInt32(kVK_Space)
+            guard let stored = store.object(forKey: "hotkeyCode") as? Int else {
+                return UInt32(kVK_Space)
+            }
+            return UInt32(stored)
         }
         set { write(Int(newValue), "hotkeyCode") }
     }
 
     static var hotkeyModifier: UInt32 {
         get {
-            let stored = store.integer(forKey: "hotkeyModifier")
-            return stored > 0 ? UInt32(stored) : UInt32(optionKey)
+            guard let stored = store.object(forKey: "hotkeyModifier") as? Int,
+                  stored != 0 else { return UInt32(optionKey) }
+            return UInt32(stored)
         }
         set { write(Int(newValue), "hotkeyModifier") }
     }

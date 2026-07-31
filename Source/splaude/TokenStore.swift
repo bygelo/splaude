@@ -46,19 +46,48 @@ enum TokenStore {
         .homeDirectoryForCurrentUser
         .appendingPathComponent(".claude/.credentials.json")
 
+    /// The credential lives in a Keychain item owned by Claude Code, so every
+    /// read is an ACL decision and macOS prompts for the login password unless
+    /// the user has clicked *Always Allow*. Reading it per take meant one
+    /// prompt per dictation for anyone who clicked plain *Allow* — or whose
+    /// grant was invalidated by a rebuild. Hold it for the session instead.
+    private static var cached: Credential?
+    private static let lock = NSLock()
+
     /// Resolves a usable token, preferring the Keychain.
+    ///
+    /// Cached across calls. The cache is dropped once the token is past its
+    /// stated expiry, so a refreshed credential is still picked up — at the
+    /// cost of exactly one prompt at that point rather than one per take.
     static func load() throws -> Credential {
+        lock.lock()
+        defer { lock.unlock() }
+
+        if let cached, !cached.isExpired { return cached }
+
         var firstFailure: Error?
 
         for attempt in [readKeychain, readFile] {
             do {
-                if let credential = try attempt() { return credential }
+                if let credential = try attempt() {
+                    cached = credential
+                    return credential
+                }
             } catch {
                 firstFailure = firstFailure ?? error
             }
         }
 
         throw firstFailure ?? TokenError.notFound
+    }
+
+    /// Drops the cached copy so the next `load()` goes back to the Keychain.
+    /// Call when the server rejects the token — an expiry we were not told
+    /// about looks exactly like a valid cached credential from here.
+    static func invalidate() {
+        lock.lock()
+        defer { lock.unlock() }
+        cached = nil
     }
 
     // MARK: - Source

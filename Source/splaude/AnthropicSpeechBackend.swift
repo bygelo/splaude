@@ -288,6 +288,15 @@ extension AnthropicSpeechBackend: URLSessionWebSocketDelegate {
             let hint = fatal
                 ? "credential rejected (HTTP \(response.statusCode)) — run `claude` to re-authenticate"
                 : "server error (HTTP \(response.statusCode))"
+
+            // The token is held for the session to avoid a Keychain prompt per
+            // take, so a rejection is the only signal that the cached copy went
+            // stale ahead of its stated expiry. Drop it or every retry reuses
+            // the same dead token.
+            if response.statusCode == 401 || response.statusCode == 403 {
+                TokenStore.invalidate()
+            }
+
             fail(hint, fatal: fatal)
         } else if let error, !isClosed, !isFinishing {
             fail("connection failed: \(error.localizedDescription)", fatal: false)

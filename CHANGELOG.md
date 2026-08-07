@@ -34,6 +34,7 @@ Notable changes to splaude. Format follows
 - `Check` workflow running formatting, clippy and tests on Linux, macOS and
   Windows, plus the Swift build, test, bundle and headless smoke check. Until
   now the only workflow ran on a tag, so nothing was verified until release.
+  Green on all four legs on its first run.
 
 ### Fixed
 
@@ -65,9 +66,9 @@ Notable changes to splaude. Format follows
   deliberately rather than changed under cover of a rewrite; the Rust test
   `a_longer_contradicting_target_may_only_append_past_the_lock` pins the
   current behaviour and names it as a divergence.
-- The Linux leg of the `Check` workflow is unverified — it was written but has
-  not yet run, so the apt packages `cpal`, `enigo` and `global-hotkey` need
-  there are a best guess until a run confirms them.
+- `Crate/app` produces no usable app. Every OS binding and the whole interface
+  are still to write, so there is nothing to run on Windows or Linux yet — only
+  a tested core and a trait set. See [docs/PORTING.md](docs/PORTING.md).
 
 ## [0.1.0] — 2026-07-31
 

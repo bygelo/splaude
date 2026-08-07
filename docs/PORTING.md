@@ -124,4 +124,6 @@ cargo build --release   # builds, but Crate/app does nothing yet
 
 The Swift build is untouched by any of this and still builds with `make`, and
 now has 23 tests of its own via `swift test`. Both suites run on every push and
-pull request through the `Check` workflow, across Linux, macOS and Windows.
+pull request through the `Check` workflow, across Linux, macOS and Windows —
+all four legs green, so the workspace is confirmed to build and pass on every
+target platform even though only the macOS app is usable yet.

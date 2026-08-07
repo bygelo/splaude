@@ -71,6 +71,17 @@ a stale registration and the next launch fails with `-600`.
 To launch at login, add `/Applications/splaude.app` under
 System Settings › General › Login Items.
 
+## Repository layout
+
+| Path | What it is |
+| --- | --- |
+| `Source/`, `Package.swift`, `Makefile` | The macOS app — this is what ships |
+| `Crate/`, `Cargo.toml` | A Rust workspace targeting Windows, Linux and macOS, which does not yet produce a usable app — see [docs/PORTING.md](docs/PORTING.md) |
+| `Script/` | Icon and banner renderers |
+
+`cargo test` runs the Rust workspace; it has no bearing on the macOS build,
+which is built with `make` as above.
+
 ## Use
 
 | Gesture | Effect |

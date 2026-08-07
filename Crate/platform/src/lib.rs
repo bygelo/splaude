@@ -1,20 +1,21 @@
-//! Per-OS integration behind one trait set.
+//! Per-OS integration.
 //!
 //! The macOS build reached straight for `AXUIElement`, `CGEvent`,
 //! `RegisterEventHotKey` and `AVAudioEngine`. Each of those is a different API
-//! on every platform, so each becomes a trait here — and the app crate above
+//! on every platform, so each becomes a module here — and the app crate above
 //! never learns which OS it is running on.
 //!
-//! Three of the six concerns turned out to need only one implementation, because
-//! a cross-platform crate already covers them everywhere:
+//! Three of the five concerns need only one implementation, because a
+//! cross-platform crate already covers them everywhere. Those are plain
+//! structs; only the two that genuinely differ per OS carry `cfg` branches.
 //!
-//! | Concern      | Backend        | Windows | macOS | Linux                  |
-//! |--------------|----------------|---------|-------|------------------------|
-//! | Audio        | `cpal`         | WASAPI  | CoreAudio | ALSA / PipeWire    |
-//! | Hotkey       | `global-hotkey`| ✓       | ✓     | X11 only — see below   |
-//! | Injection    | `enigo`        | SendInput | CGEvent | XTest / uinput     |
-//! | Focus guard  | this crate     | UIA     | AX    | none — see below       |
-//! | Autostart    | this crate     | registry | SMAppService | XDG autostart |
+//! | Concern      | Backend         | Windows   | macOS        | Linux              |
+//! |--------------|-----------------|-----------|--------------|--------------------|
+//! | Audio        | `cpal`          | WASAPI    | CoreAudio    | ALSA / PipeWire    |
+//! | Hotkey       | `global-hotkey` | ✓         | ✓            | X11 only           |
+//! | Injection    | `enigo`         | SendInput | `CGEvent`    | XTest / uinput     |
+//! | Focus guard  | this crate      | real      | not yet      | not possible       |
+//! | Autostart    | this crate      | registry  | LaunchAgent  | XDG autostart      |
 //!
 //! # Wayland
 //!
@@ -25,9 +26,17 @@
 //! Wayland session it degrades honestly rather than failing silently — see
 //! [`Capability`].
 
+pub mod audio;
+pub mod autostart;
+pub mod focus;
+pub mod hotkey;
+pub mod injector;
 pub mod resample;
 
-use anyhow::Result;
+pub use audio::Capture;
+pub use focus::FocusVerdict;
+pub use hotkey::{HotkeyEdge, HotkeyListener};
+pub use injector::Injector;
 
 /// What the current session actually permits, established at startup so the UI
 /// can say so up front rather than after a take produces nothing.
@@ -38,55 +47,69 @@ pub struct Capability {
     /// Whether the focus guard can tell a text field from anything else.
     pub inspect_focus: bool,
     pub autostart: bool,
-    /// Set when the session is one where the above are restricted by design.
+    /// Set when the session restricts the above by design, so the UI can say
+    /// which and why instead of just reporting a dead hotkey.
     pub note: Option<String>,
 }
 
-/// A push-to-talk binding is held, not tapped, so both edges matter.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HotkeyEdge {
-    Pressed,
-    Released,
+impl Capability {
+    /// Probes the running session.
+    pub fn detect() -> Self {
+        let wayland = is_wayland();
+        Self {
+            global_hotkey: !wayland,
+            inject_text: !wayland,
+            inspect_focus: focus::is_supported(),
+            autostart: true,
+            note: wayland.then(|| {
+                "Wayland does not allow a background app to register a global \
+                 hotkey or type into another window. Log into an X11 session \
+                 for push-to-talk."
+                    .to_string()
+            }),
+        }
+    }
+
+    /// Everything a take needs is available.
+    pub fn can_dictate(&self) -> bool {
+        self.global_hotkey && self.inject_text
+    }
 }
 
-/// Registers the push-to-talk binding and reports both edges.
-pub trait HotkeyListener: Send {
-    fn register(&mut self, hotkey: splaude_core::Hotkey) -> Result<()>;
-    fn unregister(&mut self) -> Result<()>;
+fn is_wayland() -> bool {
+    if !cfg!(target_os = "linux") {
+        return false;
+    }
+    std::env::var("XDG_SESSION_TYPE")
+        .map(|kind| kind.eq_ignore_ascii_case("wayland"))
+        .unwrap_or(false)
+        || std::env::var("WAYLAND_DISPLAY").is_ok()
 }
 
-/// Posts synthetic keystrokes into whatever currently has focus.
-///
-/// Implementations must clear held modifiers before every event. Push-to-talk
-/// means the binding's modifier is very likely physically down right now, and
-/// on macOS Option+Delete deletes a whole word rather than a character — the
-/// same class of bug exists on every platform.
-pub trait Injector: Send {
-    fn type_text(&mut self, text: &str) -> Result<()>;
-    fn backspace(&mut self, count: usize) -> Result<()>;
-}
+#[cfg(test)]
+mod test {
+    use super::*;
 
-/// Whether it is safe to type where focus currently is.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum FocusVerdict {
-    /// A text surface that accepts input.
-    Editable,
-    /// Focus is on something that is not text — typing would fire shortcuts.
-    NotEditable,
-    /// The platform cannot tell. Treated as permission to proceed, because
-    /// refusing every take on a platform with no introspection would make the
-    /// app useless there.
-    Unknown,
-}
+    #[test]
+    fn a_session_that_cannot_hotkey_cannot_dictate() {
+        let blocked = Capability {
+            global_hotkey: false,
+            inject_text: false,
+            inspect_focus: false,
+            autostart: true,
+            note: Some("wayland".into()),
+        };
+        assert!(!blocked.can_dictate());
+    }
 
-pub trait FocusGuard: Send {
-    fn verdict(&self) -> FocusVerdict;
-    /// Identifies the surface a take started in, so `anchor_input` can refuse
-    /// to follow focus mid-sentence. `None` when the platform cannot tell.
-    fn anchor(&self) -> Option<String>;
-}
-
-pub trait Autostart: Send {
-    fn is_enabled(&self) -> bool;
-    fn set(&self, enabled: bool) -> Result<()>;
+    #[test]
+    fn detect_reports_a_note_only_when_something_is_restricted() {
+        let capability = Capability::detect();
+        if capability.can_dictate() {
+            assert!(capability.note.is_none());
+        } else {
+            // Never leave the user with a dead hotkey and no explanation.
+            assert!(capability.note.is_some());
+        }
+    }
 }

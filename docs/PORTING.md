@@ -78,6 +78,26 @@ session it reports reduced capability at startup — see `Capability` in
 `Crate/platform/src/lib.rs` — rather than accepting a hotkey that will never
 fire and producing silence.
 
+## Direction
+
+Desktop first: macOS, Windows and Linux from this workspace, staying local and
+credential-free in the sense that matters — audio goes to the endpoint, text
+goes to your cursor, nothing is stored and nothing is uploaded.
+
+A phone or web client is deliberately deferred rather than ruled out, but it
+would be a different product sharing this one's core, and it runs into a
+blocker worth stating before anyone starts: splaude authenticates by reading
+the Claude Code OAuth credential already on the machine. There is no Claude
+Code on a phone and none in a browser, so that model does not extend. Getting
+speech-to-text there means either a real provider key of your own — which is
+what `SpeechBackend` being a three-method protocol is for — or routing many
+devices through one credential on an undocumented internal endpoint, which is a
+far larger bet than a local tool and is not a foundation to build a synced
+service on.
+
+Syncing would also make this a product that stores dictation history on a
+server, which today it deliberately does not.
+
 ## Why there is no mobile target
 
 iOS and Android cannot do the thing this app is. Neither OS lets a background

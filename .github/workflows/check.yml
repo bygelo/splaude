@@ -1,0 +1,83 @@
+name: Check
+
+# The release workflow only runs on a tag, so without this nothing is built or
+# tested until the moment it ships.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A newer push makes an in-flight run pointless.
+concurrency:
+  group: check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: Rust — ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # One platform failing is the interesting case, so let the others finish
+      # rather than cancelling them.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15, windows-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # cpal needs ALSA, enigo needs libxdo, and the hotkey listener needs the
+      # X11 and xkb headers. None ship on the runner image.
+      - name: Install Linux audio and input headers
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            pkg-config libasound2-dev libxdo-dev libxkbcommon-dev libx11-dev
+
+      - name: Report toolchain
+        run: |
+          rustc --version
+          cargo --version
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Test
+        run: cargo test --all
+
+  swift:
+    name: Swift — macOS
+    # arm64 image with Xcode 16, which is what Swift 6 needs.
+    runs-on: macos-15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Report toolchain
+        run: swift --version
+
+      - name: Build
+        run: swift build
+
+      - name: Test
+        run: swift test
+
+      # The thing users actually install is the bundle, not the raw binary, and
+      # `make bundle` is where the Info.plist and icon get assembled. Catching a
+      # broken bundle here beats catching it during a release.
+      - name: Assemble the app bundle
+        run: make bundle
+
+      # A headless smoke test: --check exercises credential lookup and the
+      # accessibility probe without opening any UI. There is no Claude Code
+      # credential on a runner, so it reports "not found" — the point is that
+      # the binary loads and exits cleanly rather than what it concludes.
+      - name: Smoke test
+        run: build/splaude.app/Contents/MacOS/splaude --check

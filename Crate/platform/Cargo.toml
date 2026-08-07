@@ -16,5 +16,5 @@ global-hotkey = "0.8.0"
 splaude-core = { version = "0.2.0", path = "../core" }
 
 [target."cfg(windows)".dependencies]
-windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_System_Threading"] }
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
 winreg = "0.56.0"

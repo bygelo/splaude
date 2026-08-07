@@ -15,4 +15,13 @@ path = "src/main.rs"
 anyhow = "1.0.104"
 splaude-core = { version = "0.2.0", path = "../core" }
 splaude-platform = { version = "0.2.0", path = "../platform" }
+tao = "0.36.0"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+
+# Windows and macOS only, deliberately. On Linux `tray-icon` pulls GTK3 and
+# libappindicator as hard build- and run-time dependencies, which is a heavy
+# ask for a console dictation tool — and it still renders nothing on a desktop
+# with no appindicator host, which stock GNOME is. Linux tray support is a
+# separate decision, not an oversight.
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+tray-icon = "0.24.2"

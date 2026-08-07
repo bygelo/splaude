@@ -6,10 +6,16 @@
 
 mod inject;
 mod take;
+#[cfg(not(target_os = "linux"))]
+mod tray;
 
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
+use tao::event::Event;
+#[cfg(not(target_os = "linux"))]
+use tao::event::StartCause;
+use tao::event_loop::{ControlFlow, EventLoopBuilder};
 
 use splaude_core::credential::Store;
 use splaude_core::{diagnostic, Setting};
@@ -28,6 +34,17 @@ OPTIONS:
     --help      Show this message.
     --version   Show the version.
 ";
+
+/// Everything that wakes the loop from outside it.
+///
+/// The hotkey callback and the tray menu handler both fire on whatever thread
+/// the platform picked, so neither touches state directly — they send one of
+/// these and let the loop, which owns the take, decide what it means.
+enum Wake {
+    Hotkey(HotkeyEdge),
+    #[cfg(not(target_os = "linux"))]
+    Menu(tray::MenuId),
+}
 
 fn main() -> Result<()> {
     let argument: Vec<String> = std::env::args().skip(1).collect();
@@ -52,6 +69,15 @@ fn main() -> Result<()> {
 }
 
 /// The dictation loop.
+///
+/// The `tao` loop here is not about windows — there are none. It is the
+/// main-thread run loop `global-hotkey` needs: on Windows it is the pump that
+/// delivers `WM_HOTKEY` to the manager's hidden window, and on macOS it is the
+/// main run loop that the Carbon hotkey handler fires on and that the manager
+/// insists on being built from. A listener that spun up its own thread could
+/// satisfy the first and never the second, so the loop lives here instead.
+///
+/// It diverges: `EventLoop::run` never returns.
 fn run() -> Result<()> {
     diagnostic::session("start");
 
@@ -75,13 +101,21 @@ fn run() -> Result<()> {
     let runtime = tokio::runtime::Runtime::new().context("could not start the async runtime")?;
     let injector = inject::spawn()?;
 
-    let (edge, inbox) = std::sync::mpsc::channel();
-    let _hotkey = HotkeyListener::new(
+    let event_loop = EventLoopBuilder::<Wake>::with_user_event().build();
+    let edge = event_loop.create_proxy();
+
+    // On this thread, deliberately: see the doc comment above. The callback
+    // runs wherever the backend emits — inside the window procedure on Windows
+    // — so it does nothing but hand the edge to the loop.
+    let hotkey = HotkeyListener::new(
         setting.hotkey,
         Box::new(move |what| {
-            let _ = edge.send(what);
+            let _ = edge.send_event(Wake::Hotkey(what));
         }),
     )?;
+
+    #[cfg(not(target_os = "linux"))]
+    tray::forward(event_loop.create_proxy(), Wake::Menu);
 
     println!("splaude is listening.");
     println!("Hold {} to dictate. Ctrl+C to quit.", setting.hotkey);
@@ -89,30 +123,86 @@ fn run() -> Result<()> {
     // One take at a time. A second key-down before the first take finished is
     // the key repeating or a stuck modifier, not a request to open two sockets.
     let mut take: Option<Take> = None;
+    // Held in an `Option` only so `LoopDestroyed` can drop it: `run` never
+    // returns, so the unregister has to happen inside the loop or not at all.
+    let mut hotkey = Some(hotkey);
+    // Built on the loop's first tick rather than here — see `StartCause::Init`
+    // below. `None` means the tray could not be created, which is survivable:
+    // the hotkey still works, there is just nothing to look at or quit from.
+    #[cfg(not(target_os = "linux"))]
+    let mut status: Option<tray::Tray> = None;
 
-    for what in inbox {
-        match what {
-            HotkeyEdge::Pressed if take.is_none() => {
-                match Take::start(
-                    runtime.handle(),
-                    Arc::clone(&store),
-                    &setting,
-                    injector.clone(),
-                ) {
-                    Ok(started) => take = Some(started),
+    event_loop.run(move |event, _target, flow| {
+        // Nothing here polls, so idling costs nothing — every edge arrives as a
+        // user event that wakes the loop by itself.
+        *flow = ControlFlow::Wait;
+
+        match event {
+            // macOS wants the status item created on a run loop that is
+            // already going, not on one that has merely been built; this is
+            // the first tick of it.
+            #[cfg(not(target_os = "linux"))]
+            Event::NewEvents(StartCause::Init) => {
+                match tray::Tray::new(&setting.hotkey.to_string()) {
+                    Ok(built) => status = Some(built),
                     Err(error) => eprintln!("splaude: {error:#}"),
                 }
             }
-            HotkeyEdge::Pressed => {}
-            HotkeyEdge::Released => {
+
+            Event::UserEvent(Wake::Hotkey(HotkeyEdge::Pressed)) => {
+                if take.is_none() {
+                    match Take::start(
+                        runtime.handle(),
+                        Arc::clone(&store),
+                        &setting,
+                        injector.clone(),
+                    ) {
+                        Ok(started) => {
+                            take = Some(started);
+                            // Only once the take is actually live: an icon that
+                            // goes red on a take that failed to start is a lie.
+                            #[cfg(not(target_os = "linux"))]
+                            if let Some(shown) = status.as_mut() {
+                                shown.set_mood(tray::Mood::Recording);
+                            }
+                        }
+                        Err(error) => eprintln!("splaude: {error:#}"),
+                    }
+                }
+            }
+            Event::UserEvent(Wake::Hotkey(HotkeyEdge::Released)) => {
                 if let Some(running) = take.take() {
                     running.finish();
                 }
+                #[cfg(not(target_os = "linux"))]
+                if let Some(shown) = status.as_mut() {
+                    shown.set_mood(tray::Mood::Idle);
+                }
             }
-        }
-    }
 
-    Ok(())
+            // The only thing in the process that asks the loop to end, and so
+            // the only reason `LoopDestroyed` below ever runs. Without it the
+            // hotkey registration outlives the process's own shutdown path.
+            #[cfg(not(target_os = "linux"))]
+            Event::UserEvent(Wake::Menu(id)) => {
+                if tray::is_quit(&id) {
+                    *flow = ControlFlow::Exit;
+                }
+            }
+
+            Event::LoopDestroyed => {
+                if let Some(running) = take.take() {
+                    running.finish();
+                }
+                drop(hotkey.take());
+                // Dropping the last handle is what removes the icon; leaving it
+                // to process teardown leaves a ghost in the tray until hover.
+                #[cfg(not(target_os = "linux"))]
+                drop(status.take());
+            }
+            _ => {}
+        }
+    })
 }
 
 /// Headless diagnostic. Opens no window and starts no take, so it is safe to

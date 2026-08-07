@@ -1,0 +1,15 @@
+[package]
+name = "splaude-platform"
+description = "Per-OS integration behind one trait set: hotkey, injector, focus, audio, tray, autostart."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow = "1.0.104"
+cpal = "0.18"
+enigo = "0.6"
+global-hotkey = "0.8.0"
+splaude-core = { version = "0.2.0", path = "../core" }

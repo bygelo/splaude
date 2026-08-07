@@ -20,9 +20,16 @@ Notable changes to splaude. Format follows
   Anthropic speech backend (endpoint, query parameters, headers, keyterm
   packing, keepalive and close framing all preserved verbatim), credential
   loading, settings, transcript buffering, quota inspection and diagnostics.
-- `Crate/platform` — the trait set each OS implements, plus a hand-rolled
-  16 kHz resampler with 10 tests, replacing `AVAudioConverter`, which has no
-  portable equivalent.
+- `Crate/platform` — every OS binding, 63 tests. Audio capture on `cpal` with a
+  hand-rolled 16 kHz resampler replacing `AVAudioConverter`; the push-to-talk
+  hotkey on `global-hotkey`, reporting press and release rather than a tap;
+  text injection on `enigo`, layout-blind and defended against the held
+  push-to-talk modifier turning a backspace into a word delete; the focus
+  guard; launch at login. Only the last two needed per-OS code.
+- `Crate/app` — a binary at last. `splaude` runs the dictation loop; `splaude
+  --check` reports credential, capability and settings state without opening a
+  window or a microphone, so it is safe over SSH and in CI. Confirmed on
+  Windows reading a real Claude Code credential.
 - A test target for the macOS app, which previously had none: 23 tests over
   transcript bookkeeping, keyterm packing and credential-expiry classification.
   It tests the executable target directly, so the app did not have to be split
@@ -66,9 +73,22 @@ Notable changes to splaude. Format follows
   deliberately rather than changed under cover of a rewrite; the Rust test
   `a_longer_contradicting_target_may_only_append_past_the_lock` pins the
   current behaviour and names it as a divergence.
-- `Crate/app` produces no usable app. Every OS binding and the whole interface
-  are still to write, so there is nothing to run on Windows or Linux yet — only
-  a tested core and a trait set. See [docs/PORTING.md](docs/PORTING.md).
+- The dictation loop has never run. `splaude --check` is confirmed against a
+  real machine; the run path is not. No hotkey has been pressed, no socket
+  opened against the endpoint, no microphone captured — so the OS integration
+  is verified by the compiler and by platform documentation, not by use.
+- On macOS the hotkey listener cannot work as designed: `global-hotkey` wants
+  its manager built on the main thread there, while Windows needs it pinned to
+  the thread owning its hidden window, so the listener spawns one. Windows and
+  X11 are unaffected. macOS runs the Swift app regardless.
+- The injector's held-modifier defence asserts a modifier key-up before every
+  synthetic event on Windows and Linux, because neither exposes a per-event
+  modifier mask. A hotkey layer that polls key state may therefore see the
+  chord end early, and a lone Alt key-up can activate a Windows menu bar. Both
+  beat deleting the user's words a word at a time; neither has been observed.
+- `Crate/app` has no tests.
+- No interface yet — tray icon, floating mic and settings window are unwritten,
+  so the binary is a console app. See [docs/PORTING.md](docs/PORTING.md).
 
 ## [0.1.0] — 2026-07-31
 

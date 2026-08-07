@@ -76,7 +76,7 @@ System Settings › General › Login Items.
 | Path | What it is |
 | --- | --- |
 | `Source/`, `Package.swift`, `Makefile` | The macOS app — this is what ships |
-| `Crate/`, `Cargo.toml` | A Rust workspace targeting Windows, Linux and macOS, which does not yet produce a usable app — see [docs/PORTING.md](docs/PORTING.md) |
+| `Crate/`, `Cargo.toml` | A Rust workspace targeting Windows, Linux and macOS. Builds a `splaude` binary whose dictation path is not yet verified on real hardware — see [docs/PORTING.md](docs/PORTING.md) |
 | `Script/` | Icon and banner renderers |
 
 `cargo test` runs the Rust workspace; it has no bearing on the macOS build,

@@ -5,9 +5,10 @@ incidentally so: almost everything it does is an operating-system integration
 point. `Crate/` holds an in-progress Rust workspace that targets Windows, Linux
 and macOS from one codebase.
 
-**Status: the Rust workspace does not yet produce a usable app.** The portable
-half is ported and tested; the OS bindings and the interface are not written.
-Use the Swift build.
+**Status: the Rust workspace builds a working `splaude` binary, but its
+dictation path has never been exercised on real hardware.** The portable core
+and every OS binding are implemented and tested; the interface (tray, floating
+mic, settings window) is not. On macOS, use the Swift build.
 
 ## Why a rewrite rather than a port
 
@@ -114,17 +115,50 @@ model, not a port of this one. It is out of scope.
   the live-typing diff extracted as pure logic. Ten of those drive the socket
   loop against a local WebSocket server rather than Anthropic, which is what
   caught a hand-built upgrade request that would have failed every connection.
-- `Crate/platform` (10 tests) — the trait set, and a windowed-sinc resampler
-  that turns whatever the input device offers into 16 kHz mono signed-16 PCM.
-  `AVAudioConverter` has no portable equivalent, so it is hand-rolled; filter
-  state carries across buffers, because resetting per callback clicks.
+- `Crate/platform` (63 tests) — every OS binding. Audio capture on `cpal` with a
+  hand-rolled windowed-sinc resampler standing in for `AVAudioConverter`; the
+  push-to-talk hotkey on `global-hotkey`, reporting both edges; text injection
+  on `enigo`; the focus guard; launch at login. Only the last two needed
+  per-OS code.
+- `Crate/app` — a binary. `splaude` runs the dictation loop; `splaude --check`
+  reports credential, capability and settings state without opening anything,
+  so it is safe over SSH and in CI.
+
+## Verified, and not
+
+`splaude --check` has been run on Windows and reads a real Claude Code
+credential out of `~/.claude/.credentials.json`. That is the one end-to-end
+path confirmed against a live machine.
+
+**The dictation loop itself has never run.** No hotkey has been pressed, no
+socket opened against the real endpoint, no microphone captured — the
+development box exposes no capture device over its remote session. The suite is
+green and every extractable piece of logic is tested, but the OS integration is
+verified by reading platform documentation and by the compiler, not by use.
+Treat the run path as unproven until someone holds the hotkey on a machine with
+a microphone and a desktop session.
+
+Two specifics that need that machine to settle:
+
+- **The held-modifier defence is load-bearing and unobserved.** Windows and X11
+  expose no per-event modifier mask, so the injector asserts a key-up for each
+  modifier before every synthetic event — otherwise `Ctrl+Backspace` deletes a
+  word at a time while push-to-talk is held. Consequences: a hotkey layer that
+  detects release by polling key state may see the chord end early, and on
+  Windows a lone Alt key-up can activate a menu bar.
+- **macOS cannot work as currently designed.** `global-hotkey` requires the
+  manager to be built on the main thread there, while Windows requires it to be
+  pinned to the thread that owns its hidden window — so the listener spawns its
+  own. Windows and X11 are unaffected; macOS needs main-thread construction
+  driven from the app crate before a Mac build is possible.
 
 ## Not done
 
-- Every OS binding: audio capture wiring, hotkey listener, text injector, focus
-  guard (×3), autostart (×3), macOS secret-store credential source.
-- The entire interface: tray icon, floating mic, settings window.
-- `Crate/app` is an empty `main`.
+- The interface: tray icon, floating mic, settings window. The binary is a
+  console app that prints what it is doing.
+- macOS secret-store credential source. The file fallback covers Windows and
+  Linux completely and most macOS installs.
+- `Crate/app` has no tests.
 - Packaging for three platforms. CI checks all three, but the release workflow
   still builds and publishes the macOS Swift bundle only, on tag.
 - One inherited bug is carried deliberately rather than fixed under cover of a
@@ -136,10 +170,11 @@ Requires Rust 1.90 or newer. On Windows the MSVC linker comes from Visual
 Studio Build Tools; cargo finds it without a developer prompt.
 
 ```sh
-cargo test --all        # 80 tests across both crates
+cargo test --all        # 133 tests across the workspace
 cargo clippy --all-targets --all-features -- -D warnings
 cargo fmt --all --check
-cargo build --release   # builds, but Crate/app does nothing yet
+cargo run -p splaude-app -- --check    # credential and capability report
+cargo build --release                  # target/release/splaude
 ```
 
 The Swift build is untouched by any of this and still builds with `make`, and

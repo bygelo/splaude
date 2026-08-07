@@ -2,11 +2,15 @@
 //!
 //! Push-to-talk is a *hold*, not a tap, so this module is only useful if it
 //! reports the key going down **and** coming back up. `global-hotkey` does
-//! carry both in [`global_hotkey::HotKeyState`], but only if something keeps
-//! draining its event channel — and on Windows, only if something keeps
-//! pumping a win32 message queue on the thread that owns the manager. Both of
-//! those loops live here, in threads this module owns, so the app crate above
-//! never learns that a hidden `HWND` is involved.
+//! carry both in [`global_hotkey::HotKeyState`], but it will only deliver them
+//! if the host runs a real event loop on its main thread: on Windows the
+//! manager is a hidden `HWND` and `WM_HOTKEY` reaches it through that thread's
+//! message queue, on macOS the Carbon handler fires on the main run loop, and
+//! macOS additionally refuses to let a library commandeer that thread. Those
+//! two demands only reconcile one way — the caller owns the loop, this module
+//! owns nothing but the registration. [`HotkeyListener::new`] must therefore be
+//! called on the thread the app pumps; `splaude-app` builds its `tao` loop
+//! there and constructs this immediately after.
 //!
 //! # Two `keyboard_types`, not one
 //!
@@ -16,20 +20,11 @@
 //! spell the same W3C vocabulary. [`to_registrable`] bridges them through that
 //! shared spelling rather than pretending the versions unify.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::Arc;
-use std::thread::JoinHandle;
-use std::time::Duration;
+use std::sync::Mutex;
 
 use anyhow::{anyhow, Result};
 use global_hotkey::hotkey::{Code, HotKey, Modifiers};
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
-
-/// How long the forwarder blocks before re-checking whether it should still be
-/// alive. It is the upper bound on how long `Drop` takes, and it costs one
-/// wakeup every interval — 50ms is cheap and imperceptible on shutdown.
-const FORWARDER_POLL: Duration = Duration::from_millis(50);
 
 /// A push-to-talk binding is held, not tapped, so both edges matter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,100 +65,153 @@ fn to_registrable(binding: splaude_core::Hotkey) -> Result<HotKey, String> {
     Ok(HotKey::new(Some(modifier), code))
 }
 
-// MARK: - Listener
+// MARK: - Sink
 
-/// What the owner thread accepts. Everything that touches the manager goes
-/// through here, because on Windows the manager is pinned to that one thread.
-enum Command {
-    Rebind(HotKey, Sender<Result<(), String>>),
-    Shutdown,
-}
-
-pub struct HotkeyListener {
-    command: Sender<Command>,
-    /// Owns the `GlobalHotKeyManager` and, on Windows, its message pump.
-    owner: Option<JoinHandle<()>>,
-    /// Drains `GlobalHotKeyEvent::receiver()` into `on_edge`.
-    forwarder: Option<JoinHandle<()>>,
-    /// Cleared on drop; the forwarder blocks in bounded waits so it sees this.
-    alive: Arc<AtomicBool>,
+/// Where an edge goes, plus the id that decides whether a press is ours.
+struct Sink {
     /// Id of the chord currently registered, so a press for a binding we have
     /// already replaced is not mistaken for ours.
-    current: Arc<AtomicU32>,
-    /// Only used to wake a blocked `GetMessageW`. Zero elsewhere.
-    #[cfg(windows)]
-    owner_thread: u32,
+    current: u32,
+    on_edge: Box<dyn Fn(HotkeyEdge) + Send + 'static>,
+}
+
+/// `global-hotkey` keeps its event handler in a `OnceCell` — set once per
+/// process, never replaced or cleared. So the handler installed below is a
+/// permanent trampoline and *this* is the part that changes: a listener writes
+/// itself in on construction and takes itself out on drop, and after that no
+/// edge reaches anyone.
+static SINK: Mutex<Option<Sink>> = Mutex::new(None);
+
+/// Routes one crate-level event to the live listener, if there still is one.
+///
+/// Runs on whichever thread the backend emits from — the app's main thread on
+/// Windows, since the trampoline is reached from inside the hidden window's
+/// procedure while the `tao` loop is dispatching. The lock is held across
+/// `on_edge`, so `on_edge` must not re-enter this module (`Mutex` is not
+/// reentrant); the app satisfies that by only forwarding to its event loop.
+fn deliver(event: GlobalHotKeyEvent) {
+    let sink = SINK.lock().unwrap_or_else(|poison| poison.into_inner());
+    let Some(sink) = sink.as_ref() else {
+        return;
+    };
+
+    match event.state {
+        // A press under an id we no longer hold is a leftover from the binding
+        // we just replaced; starting a take on it would be wrong.
+        HotKeyState::Pressed => {
+            if event.id == sink.current {
+                (sink.on_edge)(HotkeyEdge::Pressed);
+            }
+        }
+        // Releases are forwarded whatever their id. Rebinding mid-hold changes
+        // the id, and a swallowed release strands the take open with the
+        // microphone still running — far worse than a spurious stop for a take
+        // that was not running.
+        HotKeyState::Released => (sink.on_edge)(HotkeyEdge::Released),
+    }
+}
+
+fn with_sink<T>(edit: impl FnOnce(&mut Option<Sink>) -> T) -> T {
+    let mut sink = SINK.lock().unwrap_or_else(|poison| poison.into_inner());
+    edit(&mut sink)
+}
+
+// MARK: - Listener
+
+/// Owns one live registration for as long as it exists.
+///
+/// Not `Send` on Windows, by way of the manager it holds: the `HWND` inside is
+/// only addressable from the thread that created it. That is the type system
+/// stating the rule the module header describes, so keep it.
+pub struct HotkeyListener {
+    manager: GlobalHotKeyManager,
+    held: HotKey,
     binding: splaude_core::Hotkey,
 }
 
 impl HotkeyListener {
+    /// Registers `binding` and starts reporting both of its edges.
+    ///
+    /// Must be called on the thread that pumps the app's event loop; see the
+    /// module header for why no thread of our own can stand in for it.
     pub fn new(
         binding: splaude_core::Hotkey,
         on_edge: Box<dyn Fn(HotkeyEdge) + Send + 'static>,
     ) -> Result<Self> {
-        let key = to_registrable(binding).map_err(|reason| anyhow!("{binding}: {reason}"))?;
+        // Before anything can emit. `global-hotkey` latches its handler slot on
+        // the *first* event as well as on the first `set_event_handler`, so a
+        // press that beat us here would pin the slot to `None` for the life of
+        // the process and no edge would ever arrive again. The sink is still
+        // empty, so the trampoline is a no-op until the registration lands.
+        GlobalHotKeyEvent::set_event_handler(Some(deliver));
 
-        let alive = Arc::new(AtomicBool::new(true));
-        let current = Arc::new(AtomicU32::new(key.id()));
+        let held = to_registrable(binding).map_err(|reason| anyhow!("{binding}: {reason}"))?;
 
-        let (command, inbox) = mpsc::channel();
-        let (ready, started) = mpsc::channel();
+        let manager = GlobalHotKeyManager::new()
+            .map_err(|error| anyhow!("cannot bind {binding}: {error}"))?;
 
-        let owned = Arc::clone(&current);
-        let owner = std::thread::Builder::new()
-            .name("splaude-hotkey".into())
-            .spawn(move || serve(key, owned, ready, inbox))
-            .map_err(|error| anyhow!("cannot start the hotkey thread for {binding}: {error}"))?;
+        // The common failure is not a bug but a fact about the machine: another
+        // app already holds this chord. Say so, do not panic and do not go
+        // quiet.
+        manager
+            .register(held)
+            .map_err(|error| anyhow!("cannot register {binding}: {error}"))?;
 
-        // Registration happens on that thread, so its verdict has to come back
-        // before `new` can claim the binding is live.
-        let outcome = started
-            .recv()
-            .map_err(|_| anyhow!("the hotkey thread died before registering {binding}"))?;
-
-        let owner_thread = match outcome {
-            Ok(thread) => thread,
-            Err(reason) => {
-                let _ = owner.join();
-                return Err(anyhow!("cannot register {binding}: {reason}"));
-            }
-        };
-        let _ = owner_thread;
-
-        let watched = Arc::clone(&current);
-        let watching = Arc::clone(&alive);
-        let forwarder = std::thread::Builder::new()
-            .name("splaude-hotkey-edge".into())
-            .spawn(move || forward(on_edge, watched, watching))
-            .map_err(|error| anyhow!("cannot start the hotkey forwarder for {binding}: {error}"))?;
+        with_sink(|sink| {
+            *sink = Some(Sink {
+                current: held.id(),
+                on_edge,
+            })
+        });
 
         Ok(Self {
-            command,
-            owner: Some(owner),
-            forwarder: Some(forwarder),
-            alive,
-            current,
-            #[cfg(windows)]
-            owner_thread,
+            manager,
+            held,
             binding,
         })
     }
 
+    /// Moves the registration to `binding`, keeping the old one on refusal.
+    ///
+    /// Unregister-then-register, in that order: the id `global-hotkey`
+    /// registers under is derived from the chord, so registering the new one
+    /// first would leave two live registrations and report the same press
+    /// twice.
     pub fn rebind(&mut self, binding: splaude_core::Hotkey) -> Result<()> {
-        let key = to_registrable(binding).map_err(|reason| anyhow!("{binding}: {reason}"))?;
+        let next = to_registrable(binding).map_err(|reason| anyhow!("{binding}: {reason}"))?;
+        if next == self.held {
+            self.binding = binding;
+            return Ok(());
+        }
 
-        let (reply, answer) = mpsc::channel();
-        self.command
-            .send(Command::Rebind(key, reply))
-            .map_err(|_| anyhow!("the hotkey thread is gone; cannot bind {binding}"))?;
-        self.wake();
+        if let Err(error) = self.manager.unregister(self.held) {
+            splaude_core::diagnostic::log(
+                "hotkey",
+                format!("could not release {}: {error}", self.held),
+            );
+        }
 
-        answer
-            .recv()
-            .map_err(|_| anyhow!("the hotkey thread died while binding {binding}"))?
-            .map_err(|reason| anyhow!("cannot register {binding}: {reason}"))?;
+        if let Err(error) = self.manager.register(next) {
+            // A failed rebind must not leave the user with no hotkey at all.
+            match self.manager.register(self.held) {
+                Ok(()) => self.set_current(self.held.id()),
+                Err(restore) => {
+                    self.set_current(0);
+                    splaude_core::diagnostic::log(
+                        "hotkey",
+                        format!(
+                            "{next} refused and {} could not be restored: {restore}",
+                            self.held
+                        ),
+                    );
+                }
+            }
+            return Err(anyhow!("cannot register {binding}: {error}"));
+        }
 
+        self.held = next;
         self.binding = binding;
+        self.set_current(next.id());
         Ok(())
     }
 
@@ -173,243 +221,45 @@ impl HotkeyListener {
         self.binding
     }
 
-    /// Nudges the owner thread out of its blocking wait.
-    ///
-    /// On Windows that wait is `GetMessageW`, which only returns for a message;
-    /// without this, a rebind or a shutdown would sit in the queue until the
-    /// user happened to press something. The posted message has a null `hwnd`,
-    /// so dispatching it is a no-op — waking is the entire point.
-    #[cfg(windows)]
-    fn wake(&self) {
-        use windows::Win32::Foundation::{LPARAM, WPARAM};
-        use windows::Win32::UI::WindowsAndMessaging::{PostThreadMessageW, WM_APP};
-
-        unsafe {
-            let _ = PostThreadMessageW(self.owner_thread, WM_APP, WPARAM(0), LPARAM(0));
-        }
+    fn set_current(&self, id: u32) {
+        with_sink(|sink| {
+            if let Some(sink) = sink.as_mut() {
+                sink.current = id;
+            }
+        });
     }
-
-    /// Elsewhere the owner thread blocks on the channel itself, so sending is
-    /// already the wakeup.
-    #[cfg(not(windows))]
-    fn wake(&self) {}
 }
 
 impl Drop for HotkeyListener {
     fn drop(&mut self) {
-        // Order matters: clear `alive` first so the forwarder stops at its next
-        // poll, then let the owner thread unregister and exit. Joining both is
-        // what makes a rebind-by-replacement safe — a new listener cannot start
-        // registering while the old chord is still live and still forwarding.
-        self.alive.store(false, Ordering::Release);
-        let _ = self.command.send(Command::Shutdown);
-        self.wake();
+        // Order matters: silence the sink first, so an edge already queued in
+        // the message loop cannot reach a callback whose owner is on its way
+        // out.
+        with_sink(|sink| *sink = None);
 
-        if let Some(owner) = self.owner.take() {
-            let _ = owner.join();
-        }
-        if let Some(forwarder) = self.forwarder.take() {
-            let _ = forwarder.join();
-        }
-        self.current.store(0, Ordering::Release);
-    }
-}
-
-// MARK: - Owner thread
-
-/// Owns the manager for its whole life and never lets it cross a thread.
-///
-/// `GlobalHotKeyManager` is not `Send` on Windows — it is a hidden `HWND`, and
-/// win32 delivers `WM_HOTKEY` to the queue of the thread that created it. So
-/// the manager is constructed here, every registration change is a [`Command`]
-/// sent here, and the unregister on the way out happens here too.
-fn serve(
-    first: HotKey,
-    current: Arc<AtomicU32>,
-    ready: Sender<Result<u32, String>>,
-    inbox: Receiver<Command>,
-) {
-    let manager = match GlobalHotKeyManager::new() {
-        Ok(manager) => manager,
-        Err(error) => {
-            let _ = ready.send(Err(error.to_string()));
-            return;
-        }
-    };
-
-    // The common failure is not a bug but a fact about the machine: another app
-    // already holds this chord. Say so, do not panic and do not go quiet.
-    if let Err(error) = manager.register(first) {
-        let _ = ready.send(Err(error.to_string()));
-        return;
-    }
-
-    let mut held = first;
-    current.store(held.id(), Ordering::Release);
-    if ready.send(Ok(current_thread())).is_err() {
-        let _ = manager.unregister(held);
-        return;
-    }
-
-    while let Some(command) = next_command(&inbox) {
-        match command {
-            Command::Rebind(next, reply) => {
-                let outcome = swap(&manager, &mut held, next, &current);
-                let _ = reply.send(outcome);
-            }
-            Command::Shutdown => break,
-        }
-    }
-
-    // The one unregister that must not be skipped: leaving it registered means
-    // the chord stays dead for every other app until the process exits.
-    if let Err(error) = manager.unregister(held) {
-        splaude_core::diagnostic::log("hotkey", format!("could not release {held}: {error}"));
-    }
-}
-
-/// Unregister-then-register, restoring the old chord if the new one is taken.
-///
-/// Doing it in this order matters: the id `global-hotkey` registers under is
-/// derived from the chord, so registering the new one first would leave two
-/// live registrations and the same press would be reported twice.
-fn swap(
-    manager: &GlobalHotKeyManager,
-    held: &mut HotKey,
-    next: HotKey,
-    current: &AtomicU32,
-) -> Result<(), String> {
-    if *held == next {
-        return Ok(());
-    }
-
-    if let Err(error) = manager.unregister(*held) {
-        splaude_core::diagnostic::log("hotkey", format!("could not release {held}: {error}"));
-    }
-
-    if let Err(error) = manager.register(next) {
-        // A failed rebind must not leave the user with no hotkey at all.
-        match manager.register(*held) {
-            Ok(()) => current.store(held.id(), Ordering::Release),
-            Err(restore) => {
-                current.store(0, Ordering::Release);
-                splaude_core::diagnostic::log(
-                    "hotkey",
-                    format!("{next} refused and {held} could not be restored: {restore}"),
-                );
-            }
-        }
-        return Err(error.to_string());
-    }
-
-    *held = next;
-    current.store(next.id(), Ordering::Release);
-    Ok(())
-}
-
-/// Blocks until a command arrives, pumping win32 messages while it waits.
-///
-/// `global-hotkey` installs a window procedure and win32 posts `WM_HOTKEY` to
-/// this thread's queue; without a `GetMessageW`/`DispatchMessageW` loop that
-/// procedure is never called and *no* edge is ever emitted. The loop lives here
-/// rather than in the app because this is the thread that owns the window.
-#[cfg(windows)]
-fn next_command(inbox: &Receiver<Command>) -> Option<Command> {
-    use std::sync::mpsc::TryRecvError;
-    use windows::Win32::UI::WindowsAndMessaging::{
-        DispatchMessageW, GetMessageW, TranslateMessage, MSG,
-    };
-
-    loop {
-        match inbox.try_recv() {
-            Ok(command) => return Some(command),
-            Err(TryRecvError::Disconnected) => return None,
-            Err(TryRecvError::Empty) => {}
-        }
-
-        let mut message = MSG::default();
-        // Blocking, not polling: a spin loop here would burn a core for the
-        // life of the app. `HotkeyListener::wake` posts a message so a command
-        // never waits on a keystroke to be noticed.
-        let got = unsafe { GetMessageW(&mut message, None, 0, 0) };
-        if got.0 <= 0 {
-            // 0 is WM_QUIT, -1 is an error; either way this queue is finished.
-            return None;
-        }
-        unsafe {
-            let _ = TranslateMessage(&message);
-            DispatchMessageW(&message);
-        }
-    }
-}
-
-/// X11 runs its own event thread inside `global-hotkey`, and macOS delivers on
-/// the application run loop, so there is no queue for us to pump — blocking on
-/// the channel is the whole wait.
-#[cfg(not(windows))]
-fn next_command(inbox: &Receiver<Command>) -> Option<Command> {
-    inbox.recv().ok()
-}
-
-#[cfg(windows)]
-fn current_thread() -> u32 {
-    unsafe { windows::Win32::System::Threading::GetCurrentThreadId() }
-}
-
-#[cfg(not(windows))]
-fn current_thread() -> u32 {
-    0
-}
-
-// MARK: - Forwarder thread
-
-/// Drains the crate's global event channel into `on_edge`.
-///
-/// This has to be a second thread: on Windows the owner thread is parked in
-/// `GetMessageW`, and the edge that `WM_HOTKEY` produces arrives on a
-/// `crossbeam` channel, not the win32 queue. One consumer only — the channel is
-/// process-wide, so a second listener would steal half the events.
-fn forward(
-    on_edge: Box<dyn Fn(HotkeyEdge) + Send + 'static>,
-    current: Arc<AtomicU32>,
-    alive: Arc<AtomicBool>,
-) {
-    let receiver = GlobalHotKeyEvent::receiver();
-
-    while alive.load(Ordering::Acquire) {
-        let event = match receiver.recv_timeout(FORWARDER_POLL) {
-            Ok(event) => event,
-            Err(error) if error.is_disconnected() => return,
-            // A timeout is just the liveness check coming round.
-            Err(_) => continue,
-        };
-
-        match event.state {
-            // A press under an id we no longer hold is a leftover from the
-            // binding we just replaced; starting a take on it would be wrong.
-            HotKeyState::Pressed => {
-                if event.id == current.load(Ordering::Acquire) {
-                    on_edge(HotkeyEdge::Pressed);
-                }
-            }
-            // Releases are forwarded whatever their id. Rebinding mid-hold
-            // changes the id, and a swallowed release strands the take open
-            // with the microphone still running — far worse than a spurious
-            // stop for a take that was not running.
-            HotKeyState::Released => on_edge(HotkeyEdge::Released),
+        // The one unregister that must not be skipped: leaving it registered
+        // means the chord stays dead for every other app until the process
+        // exits.
+        if let Err(error) = self.manager.unregister(self.held) {
+            splaude_core::diagnostic::log(
+                "hotkey",
+                format!("could not release {}: {error}", self.held),
+            );
         }
     }
 }
 
 // MARK: - Test
 //
-// Mapping only. Registering a real global hotkey needs a window server, so a
-// test that did it would fail in CI for reasons that have nothing to do with
-// this code.
+// Mapping and sink routing only. Registering a real global hotkey needs a
+// window server, so a test that did it would fail in CI for reasons that have
+// nothing to do with this code.
 
 #[cfg(test)]
 mod test {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     fn parsed(text: &str) -> HotKey {
         to_registrable(text.parse::<splaude_core::Hotkey>().unwrap()).unwrap()
@@ -450,8 +300,8 @@ mod test {
 
     #[test]
     fn the_id_distinguishes_bindings_and_is_stable() {
-        // The forwarder filters presses by this id, so equal chords must agree
-        // and different chords must not.
+        // The sink filters presses by this id, so equal chords must agree and
+        // different chords must not.
         assert_eq!(parsed("Ctrl+KeyD").id(), parsed("Ctrl+KeyD").id());
         assert_ne!(parsed("Ctrl+KeyD").id(), parsed("Alt+KeyD").id());
         assert_ne!(parsed("Ctrl+KeyD").id(), parsed("Ctrl+KeyE").id());
@@ -487,5 +337,64 @@ mod test {
     #[test]
     fn both_edges_exist_as_distinct_values() {
         assert_ne!(HotkeyEdge::Pressed, HotkeyEdge::Released);
+    }
+
+    // The routing rules below are the whole reason push-to-talk survives a
+    // rebind, and `deliver` is reachable without registering anything — the
+    // sink is just a `static`. `SINK` is process-wide, so these run as one test
+    // rather than racing each other across the harness's threads.
+    #[test]
+    fn the_sink_filters_presses_by_id_and_never_filters_releases() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let recording = Arc::clone(&seen);
+        let mine = parsed("Ctrl+KeyD").id();
+        let stale = parsed("Alt+KeyD").id();
+
+        with_sink(|sink| {
+            *sink = Some(Sink {
+                current: mine,
+                on_edge: Box::new(move |edge| recording.lock().unwrap().push(edge)),
+            })
+        });
+
+        deliver(GlobalHotKeyEvent {
+            id: mine,
+            state: HotKeyState::Pressed,
+        });
+        // The press for a chord we have already replaced must not start a take.
+        deliver(GlobalHotKeyEvent {
+            id: stale,
+            state: HotKeyState::Pressed,
+        });
+        // The release for that same stale chord must still arrive, or a rebind
+        // mid-hold would strand the take open.
+        deliver(GlobalHotKeyEvent {
+            id: stale,
+            state: HotKeyState::Released,
+        });
+
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [HotkeyEdge::Pressed, HotkeyEdge::Released]
+        );
+
+        // An empty sink is silent, which is what makes dropping a listener safe
+        // while an edge is already in flight.
+        let counted = Arc::new(AtomicUsize::new(0));
+        let counting = Arc::clone(&counted);
+        with_sink(|sink| {
+            *sink = Some(Sink {
+                current: mine,
+                on_edge: Box::new(move |_| {
+                    counting.fetch_add(1, Ordering::Relaxed);
+                }),
+            })
+        });
+        with_sink(|sink| *sink = None);
+        deliver(GlobalHotKeyEvent {
+            id: mine,
+            state: HotKeyState::Released,
+        });
+        assert_eq!(counted.load(Ordering::Relaxed), 0);
     }
 }

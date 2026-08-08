@@ -131,7 +131,7 @@ fn run() -> Result<()> {
     }
 
     let runtime = tokio::runtime::Runtime::new().context("could not start the async runtime")?;
-    let injector = inject::spawn()?;
+    let injector = inject::spawn(setting.hotkey)?;
 
     let event_loop = EventLoopBuilder::<Wake>::with_user_event().build();
     let edge = event_loop.create_proxy();

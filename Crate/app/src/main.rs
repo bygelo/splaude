@@ -27,7 +27,7 @@ use tao::event::StartCause;
 use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
 
 use splaude_core::credential::Store;
-use splaude_core::{diagnostic, quota, Setting};
+use splaude_core::{diagnostic, quota, update, Setting};
 use splaude_platform::{autostart, focus, submit, Capability, HotkeyEdge, HotkeyListener};
 use take::{Report, Take};
 
@@ -91,6 +91,9 @@ enum Wake {
     /// A credential re-read, from the polling thread.
     #[cfg(not(target_os = "linux"))]
     Health(Option<String>),
+    /// What an update check found, from the thread that made the request.
+    #[cfg(not(target_os = "linux"))]
+    Update(update::Reading),
 }
 
 // MARK: - Take state
@@ -312,6 +315,14 @@ fn run() -> Result<()> {
         });
     }
 
+    // Once at startup, and then only when asked. A manual-only check is theatre:
+    // the reason people run an old build is not that downloading is hard, it is
+    // that nobody told them. Once per launch also stays far inside GitHub's
+    // unauthenticated allowance of sixty requests an hour, which this shares
+    // with everything else on the address.
+    #[cfg(not(target_os = "linux"))]
+    check_update(event_loop.create_proxy());
+
     // Settled here rather than per take, and re-settled by a reload rather than
     // on every key-down: asking again per dictation would put the same line in
     // the log once per take.
@@ -319,6 +330,15 @@ fn run() -> Result<()> {
     let mut stop_on_return = watching_return(&setting);
 
     let submit_proxy = event_loop.create_proxy();
+
+    // The tray renders this and the click handler reads it, so it lives here
+    // and is mirrored onto the tray rather than the other way round: asking a
+    // platform menu what it currently says, to decide what a click means, is a
+    // question with a different answer on every toolkit.
+    #[cfg(not(target_os = "linux"))]
+    let mut update_reading = update::Reading::Unknown;
+    #[cfg(not(target_os = "linux"))]
+    let update_proxy = event_loop.create_proxy();
 
     println!("splaude is listening.");
     println!(
@@ -486,6 +506,16 @@ fn run() -> Result<()> {
                     shown.set_health(headline);
                 }
             }
+
+            // Kept here as well as on the tray because the click needs it: the
+            // tray renders the reading, and this decides what clicking it does.
+            #[cfg(not(target_os = "linux"))]
+            Event::UserEvent(Wake::Update(reading)) => {
+                update_reading = reading.clone();
+                if let Some(shown) = status.as_mut() {
+                    shown.set_update(reading);
+                }
+            }
             // The only thing in the process that asks the loop to end, and so
             // the only reason `LoopDestroyed` below ever runs. Without it the
             // hotkey registration outlives the process's own shutdown path.
@@ -505,6 +535,15 @@ fn run() -> Result<()> {
                 // whole point is to answer "do keystrokes from this app land
                 // anywhere" without speaking, so it has to work at rest.
                 tray::Ask::TestPaste => take::probe(setting.clone(), injector.clone()),
+
+                // One item, two meanings, decided by what the last check found:
+                // an update that exists is a link, and anything else is an
+                // invitation to look again. Re-checking on a click is also the
+                // only way back from a failed check without restarting.
+                tray::Ask::Update => match &update_reading {
+                    update::Reading::Available(release) => tray::open_release(&release.url),
+                    _ => check_update(update_proxy.clone()),
+                },
 
                 tray::Ask::EditSetting => tray::edit_setting(&setting),
 
@@ -720,6 +759,22 @@ fn reload(
 /// for every keystroke on the desktop, so it does nothing but post — the same
 /// shape as the hotkey and tray callbacks, for a stricter version of the same
 /// reason.
+/// Ask GitHub what the newest release is, on a thread that may block.
+///
+/// Fire and forget. The answer arrives as a [`Wake::Update`] if the loop is
+/// still running and is dropped if it is not, which is what should happen to an
+/// update notice for a process that is quitting. Nothing waits on this and
+/// nothing fails if it never answers — an unreachable network leaves the menu
+/// item exactly where it was.
+#[cfg(not(target_os = "linux"))]
+fn check_update(proxy: EventLoopProxy<Wake>) {
+    std::thread::spawn(move || {
+        let reading = update::check();
+        diagnostic::log("update", reading.line());
+        let _ = proxy.send_event(Wake::Update(reading));
+    });
+}
+
 fn watch_return(watching: bool, proxy: &EventLoopProxy<Wake>) -> Option<submit::Watch> {
     if !watching {
         return None;
@@ -807,6 +862,14 @@ fn check() -> Result<()> {
     println!("quota");
     println!("  rate limit  {}", quota::summary());
     println!("  a handshake that answers with no anthropic-ratelimit header spent nothing");
+    println!();
+
+    // The one thing in this report that reaches the network, and the only
+    // reason `--check` is not entirely offline. Worth the exception: someone
+    // running this because dictation misbehaved should be told if they are
+    // three releases behind before they read anything else here.
+    println!("update");
+    println!("  {}", update::check().line());
     println!();
 
     let (setting, note) = Setting::load_checked();

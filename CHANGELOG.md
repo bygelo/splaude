@@ -4,6 +4,27 @@ Notable changes to splaude. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- splaude says when a newer version has been published. It asks GitHub once at
+  startup and whenever the menu item is clicked, and the item does double duty:
+  an update that exists opens the release page, anything else goes and looks
+  again. Reported in `--check` too, which is the only part of that report that
+  reaches the network.
+- An available update is promoted to the top of the menu, beside the credential
+  warning, and only when there is one. "You are up to date" is an answer to a
+  question, not news, so it stays in the diagnostics group below.
+
+It checks and reports; it does not download, replace or restart anything. That
+is a stopping point rather than an unfinished feature, and macOS is the reason:
+this build is ad-hoc signed, so its code identity changes every release, and
+macOS keys Accessibility and Microphone grants to that identity. A Mac that
+updated itself would silently lose permission to do the only thing it exists to
+do. Self-installation is tractable on Windows and Linux and is worth doing
+there — behind a signature, not a bare download — but it is a separate change.
+
 ## [0.2.0] — 2026-08-08
 
 ### Added

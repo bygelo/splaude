@@ -19,7 +19,7 @@ use anyhow::{anyhow, Result};
 use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
-use splaude_core::{diagnostic, quota, Setting};
+use splaude_core::{diagnostic, quota, update, Setting};
 
 use crate::icon;
 
@@ -41,6 +41,7 @@ const AUTOSTART: &str = "splaude:autostart";
 const TEST_PASTE: &str = "splaude:test-paste";
 const EDIT_SETTING: &str = "splaude:edit-setting";
 const RELOAD_SETTING: &str = "splaude:reload-setting";
+const UPDATE: &str = "splaude:update";
 
 /// Longest transcript preview the menu will show, in characters.
 ///
@@ -68,6 +69,11 @@ pub enum Ask {
     EditSetting,
     /// Re-read the settings file and apply what can be applied live.
     ReloadSetting,
+    /// The update item. What it means depends on what the last check found —
+    /// open the release page, or go and look again — and the caller holds that
+    /// reading, so the click stays one `Ask` rather than two the tray would
+    /// have to choose between.
+    Update,
     /// A click on a label, or on an id from some other `muda` consumer.
     Ignore,
 }
@@ -84,6 +90,11 @@ pub struct Tray {
     /// preview; the clipboard gets all of it.
     transcript: Option<String>,
     autostart: bool,
+    /// What the last update check found. Held rather than read live, unlike the
+    /// quota line, because this one costs a network request — a menu that
+    /// checked GitHub every time it was drawn would spend its hourly allowance
+    /// on someone opening the menu.
+    update: update::Reading,
 }
 
 impl Tray {
@@ -112,6 +123,7 @@ impl Tray {
             note: None,
             transcript: None,
             autostart,
+            update: update::Reading::Unknown,
         };
         tray.rebuild()?;
 
@@ -224,6 +236,15 @@ impl Tray {
         }
     }
 
+    /// What the last update check found.
+    pub fn set_update(&mut self, reading: update::Reading) {
+        if self.update == reading {
+            return;
+        }
+        self.update = reading;
+        self.redraw_menu();
+    }
+
     /// `muda` has no notion of a hidden item, so an item that is sometimes
     /// absent means replacing the menu rather than editing it. That is also
     /// how the Swift build works — `buildMenu()` makes a fresh `NSMenu` every
@@ -246,7 +267,20 @@ impl Tray {
         if let Some(line) = &self.note {
             append(&menu, &MenuItem::new(line, false, None))?;
         }
-        if self.health.is_some() || self.note.is_some() {
+        // An available update is promoted into the same block, and only when
+        // there is one. It is the same kind of statement as the two above —
+        // something is not in the state you assume — and the bottom of a menu
+        // is where a notice goes to be unread. Every other reading stays in the
+        // diagnostics group below, because "you are up to date" is an answer to
+        // a question, not news.
+        let promoted = self.update.is_worth_saying();
+        if promoted {
+            append(
+                &menu,
+                &MenuItem::with_id(UPDATE, update_line(&self.update), true, None),
+            )?;
+        }
+        if self.health.is_some() || self.note.is_some() || promoted {
             append(&menu, &PredefinedMenuItem::separator())?;
         }
 
@@ -302,6 +336,14 @@ impl Tray {
             &menu,
             &MenuItem::with_id(REVEAL_LOG, "Reveal Log", true, None),
         )?;
+        // Unless it was promoted above, where a duplicate id would give the
+        // same click two places to come from.
+        if !promoted {
+            append(
+                &menu,
+                &MenuItem::with_id(UPDATE, update_line(&self.update), true, None),
+            )?;
+        }
         append(&menu, &PredefinedMenuItem::separator())?;
         append(&menu, &MenuItem::with_id(QUIT, "Quit splaude", true, None))?;
 
@@ -328,6 +370,7 @@ pub fn ask(id: &MenuId) -> Ask {
         TEST_PASTE => Ask::TestPaste,
         EDIT_SETTING => Ask::EditSetting,
         RELOAD_SETTING => Ask::ReloadSetting,
+        UPDATE => Ask::Update,
         _ => Ask::Ignore,
     }
 }
@@ -341,6 +384,22 @@ pub fn ask(id: &MenuId) -> Ask {
 /// wording can be checked without a desktop, a socket or a take.
 fn quota_line(reading: &quota::Reading) -> String {
     format!("Claude quota: {}", reading.line())
+}
+
+/// How an update reading reads as a clickable item.
+///
+/// Every one of these is enabled, and each one does something when clicked:
+/// the available reading opens the release page, and the other three go and
+/// look again. That is why none of them is phrased as a bare statement — an
+/// item that reads "0.2.0 is the latest" and does nothing would be a label, and
+/// this is not one. The trailing ellipsis marks the two that leave the app.
+fn update_line(reading: &update::Reading) -> String {
+    match reading {
+        update::Reading::Unknown => "Check for Updates".into(),
+        update::Reading::Current => format!("splaude {} is the latest", update::current()),
+        update::Reading::Available(release) => format!("Update to {}…", release.version),
+        update::Reading::Failed(_) => "Check for Updates (last try failed)".into(),
+    }
 }
 
 /// Open the settings file in whatever this machine edits JSON with.
@@ -369,27 +428,51 @@ pub fn edit_setting(setting: &Setting) {
         }
     }
 
+    hand_to_desktop("setting", path.as_os_str());
+}
+
+/// Hand something to whatever this desktop opens it with.
+///
+/// A path or a URL — the platform openers take either, which is the whole
+/// reason this is one function and not two. Extracted when the release page
+/// became the third caller; three copies of a `cfg` ladder is where one of them
+/// starts quietly differing from the others.
+///
+/// `topic` names the caller in the log, so a failure says which gesture failed
+/// rather than only that an opener did.
+fn hand_to_desktop(topic: &str, target: &std::ffi::OsStr) {
     // `start` is a shell builtin, not an executable, so it needs `cmd`. The
     // empty first argument is the window title `start` would otherwise take the
-    // path for — without it a quoted path becomes the title and nothing opens.
+    // target for — without it a quoted path becomes the title and nothing opens.
     #[cfg(target_os = "windows")]
     let spawned = std::process::Command::new("cmd")
         .args(["/c", "start", ""])
-        .arg(&path)
+        .arg(target)
         .spawn();
 
     #[cfg(target_os = "macos")]
-    let spawned = std::process::Command::new("open").arg(&path).spawn();
+    let spawned = std::process::Command::new("open").arg(target).spawn();
 
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-    let spawned = std::process::Command::new("xdg-open").arg(&path).spawn();
+    let spawned = std::process::Command::new("xdg-open").arg(target).spawn();
 
     if let Err(error) = spawned {
         diagnostic::log(
-            "setting",
-            format!("could not open {}: {error}", path.display()),
+            topic,
+            format!("could not open {}: {error}", target.to_string_lossy()),
         );
     }
+}
+
+/// Open a release page in the browser.
+///
+/// Only ever called with a URL that came out of [`splaude_core::update`], which
+/// takes it from GitHub's own answer for the one repository this build names.
+/// Worth stating because handing an arbitrary string to the platform opener is
+/// how a link becomes a command.
+pub fn open_release(url: &str) {
+    diagnostic::log("update", format!("opening {url}"));
+    hand_to_desktop("update", std::ffi::OsStr::new(url));
 }
 
 /// Show the log file in the platform's file manager, selected.
@@ -536,6 +619,71 @@ mod test {
         assert_eq!(ask(&MenuId::new(TEST_PASTE)), Ask::TestPaste);
         assert_eq!(ask(&MenuId::new(EDIT_SETTING)), Ask::EditSetting);
         assert_eq!(ask(&MenuId::new(RELOAD_SETTING)), Ask::ReloadSetting);
+        assert_eq!(ask(&MenuId::new(UPDATE)), Ask::Update);
+    }
+
+    fn published(major: u32, minor: u32, patch: u32) -> update::Release {
+        update::Release {
+            version: update::Version {
+                major,
+                minor,
+                patch,
+            },
+            url: "https://example.invalid/release".into(),
+        }
+    }
+
+    /// Only the available reading is promoted into the top block, so only it may
+    /// claim the position the credential warning uses. The other three are
+    /// answers to a question, and a menu that opens with "you are up to date"
+    /// has spent its most-read line on nothing.
+    #[test]
+    fn only_an_available_update_is_promoted() {
+        assert!(update::Reading::Available(published(9, 9, 9)).is_worth_saying());
+        for quiet in [
+            update::Reading::Unknown,
+            update::Reading::Current,
+            update::Reading::Failed("offline".into()),
+        ] {
+            assert!(!quiet.is_worth_saying(), "{quiet:?} would be promoted");
+        }
+    }
+
+    /// Every one of these is a clickable item, so none may read as a dead label
+    /// and none may render empty — including the failed one, which is the whole
+    /// way back from a check that did not answer.
+    #[test]
+    fn every_update_line_fits_a_menu_item() {
+        for reading in [
+            update::Reading::Unknown,
+            update::Reading::Current,
+            update::Reading::Available(published(1, 2, 3)),
+            update::Reading::Failed("timed out".into()),
+        ] {
+            let line = update_line(&reading);
+            assert!(!line.trim().is_empty(), "{reading:?} rendered empty");
+            assert!(line.chars().count() <= 60, "{line}");
+            assert!(!line.contains('\n'), "{line}");
+        }
+    }
+
+    /// The version has to reach the item, or it says an update exists without
+    /// saying which — and the click that follows is a leap of faith.
+    #[test]
+    fn the_available_line_names_the_version() {
+        let line = update_line(&update::Reading::Available(published(1, 2, 3)));
+        assert!(line.contains("1.2.3"), "{line}");
+    }
+
+    /// A failed check must not read like a successful one. The distinction is
+    /// the same one the quota line makes: not knowing is not the same as knowing
+    /// there is nothing.
+    #[test]
+    fn a_failed_check_does_not_read_as_up_to_date() {
+        let failed = update_line(&update::Reading::Failed("offline".into()));
+        let current = update_line(&update::Reading::Current);
+        assert_ne!(failed, current);
+        assert!(failed.contains("failed"), "{failed}");
     }
 
     #[test]

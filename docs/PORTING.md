@@ -188,9 +188,6 @@ borrow. Introducing one satisfies both, and CI now compiles the result on
   appindicator host, which stock GNOME is.
 - macOS secret-store credential source. The file fallback covers Windows and
   Linux completely and most macOS installs.
-- A Windows executable icon. The tray mark is drawn at runtime; the `.exe`
-  itself still shows the default, which needs a build script and a resource
-  compiler rather than any of the code above.
 - On Windows, splaude will physically press Return if a transcript ever
   contains a newline — `enigo` special-cases `\n` with a real key click instead
   of a unicode payload. Latent, and not fixed.

@@ -19,8 +19,18 @@ use tao::event_loop::{ControlFlow, EventLoopBuilder};
 
 use splaude_core::credential::Store;
 use splaude_core::{diagnostic, Setting};
-use splaude_platform::{Capability, HotkeyEdge, HotkeyListener};
-use take::Take;
+use splaude_platform::{autostart, Capability, HotkeyEdge, HotkeyListener};
+use take::{Report, Take};
+
+/// How often the credential is re-read, matching the Swift build's timer.
+///
+/// splaude reads the Claude Code token but never refreshes it, so a session
+/// that outlives the token has to hear about it from somewhere. Polling is what
+/// makes the menu warn *before* a take fails rather than at the moment the
+/// hotkey is pressed; five minutes is under the credential's own ten-minute
+/// warning window, so the warning is never more than one poll late.
+#[cfg(not(target_os = "linux"))]
+const HEALTH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
 
 const USAGE: &str = "\
 splaude — push-to-talk dictation
@@ -44,6 +54,15 @@ enum Wake {
     Hotkey(HotkeyEdge),
     #[cfg(not(target_os = "linux"))]
     Menu(tray::MenuId),
+    /// A change of input level step, from the audio callback.
+    #[cfg(not(target_os = "linux"))]
+    Level(u8),
+    /// One take's committed text, from the socket task.
+    #[cfg(not(target_os = "linux"))]
+    Transcript(String),
+    /// A credential re-read, from the polling thread.
+    #[cfg(not(target_os = "linux"))]
+    Health(Option<String>),
 }
 
 fn main() -> Result<()> {
@@ -81,7 +100,10 @@ fn main() -> Result<()> {
 fn run() -> Result<()> {
     diagnostic::session("start");
 
-    let setting = Setting::load();
+    // `mut` only on the platforms that have a tray: the launch-at-login item
+    // is the one thing in the loop that writes a setting back.
+    #[cfg_attr(target_os = "linux", allow(unused_mut))]
+    let mut setting = Setting::load();
     let store = Arc::new(credential_store());
     let capability = Capability::detect();
 
@@ -96,6 +118,16 @@ fn run() -> Result<()> {
     // holds it — a take that dies on key-down looks like the app is broken.
     if let Err(error) = store.load() {
         eprintln!("splaude: {error}\n");
+    }
+
+    // The setting is the intent and the machine is reconciled to it, not the
+    // other way round — see `splaude_core::setting`. Doing it on every launch
+    // is also what repairs an entry left pointing at an install location that
+    // has since moved, which would otherwise launch nothing at login.
+    if setting.launch_at_login != autostart::is_enabled() {
+        if let Err(error) = autostart::set(setting.launch_at_login) {
+            eprintln!("splaude: could not reconcile launch at login: {error:#}\n");
+        }
     }
 
     let runtime = tokio::runtime::Runtime::new().context("could not start the async runtime")?;
@@ -116,6 +148,35 @@ fn run() -> Result<()> {
 
     #[cfg(not(target_os = "linux"))]
     tray::forward(event_loop.create_proxy(), Wake::Menu);
+
+    // Sampled once here so the menu is right the moment it first opens, then
+    // on a timer. The read is cached inside the store, so this costs nothing
+    // on top of the `store.load()` above.
+    #[cfg(not(target_os = "linux"))]
+    let health = store.health().headline();
+    #[cfg(not(target_os = "linux"))]
+    let level_proxy = event_loop.create_proxy();
+    #[cfg(not(target_os = "linux"))]
+    let transcript_proxy = event_loop.create_proxy();
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        // Off the main thread on purpose: a credential read can reach a secret
+        // store, which blocks whoever asks, and the main thread here is the
+        // one drawing the menu. The loop ends when the proxy stops accepting,
+        // which is how the process gets to exit.
+        let proxy = event_loop.create_proxy();
+        let watched = Arc::clone(&store);
+        std::thread::spawn(move || loop {
+            std::thread::sleep(HEALTH_INTERVAL);
+            if proxy
+                .send_event(Wake::Health(watched.health().headline()))
+                .is_err()
+            {
+                break;
+            }
+        });
+    }
 
     println!("splaude is listening.");
     println!("Hold {} to dictate. Ctrl+C to quit.", setting.hotkey);
@@ -143,7 +204,11 @@ fn run() -> Result<()> {
             // the first tick of it.
             #[cfg(not(target_os = "linux"))]
             Event::NewEvents(StartCause::Init) => {
-                match tray::Tray::new(&setting.hotkey.to_string()) {
+                match tray::Tray::new(
+                    &setting.hotkey.to_string(),
+                    health.clone(),
+                    setting.launch_at_login,
+                ) {
                     Ok(built) => status = Some(built),
                     Err(error) => eprintln!("splaude: {error:#}"),
                 }
@@ -151,23 +216,66 @@ fn run() -> Result<()> {
 
             Event::UserEvent(Wake::Hotkey(HotkeyEdge::Pressed)) => {
                 if take.is_none() {
+                    #[cfg(not(target_os = "linux"))]
+                    let report = report(&level_proxy, &transcript_proxy);
+                    #[cfg(target_os = "linux")]
+                    let report = Report::silent();
+
                     match Take::start(
                         runtime.handle(),
                         Arc::clone(&store),
                         &setting,
                         injector.clone(),
+                        report,
                     ) {
                         Ok(started) => {
                             take = Some(started);
                             // Only once the take is actually live: an icon that
                             // goes red on a take that failed to start is a lie.
+                            // Step zero — the meter starts empty and the first
+                            // audio buffer raises it.
                             #[cfg(not(target_os = "linux"))]
                             if let Some(shown) = status.as_mut() {
-                                shown.set_mood(tray::Mood::Recording);
+                                shown.set_mood(tray::Mood::Recording(0));
                             }
                         }
-                        Err(error) => eprintln!("splaude: {error:#}"),
+                        Err(error) => {
+                            eprintln!("splaude: {error:#}");
+                            // The take may well have died on the credential, so
+                            // say so in the menu now rather than at the next
+                            // poll, five minutes from now.
+                            #[cfg(not(target_os = "linux"))]
+                            if let Some(shown) = status.as_mut() {
+                                shown.set_health(store.health().headline());
+                            }
+                        }
                     }
+                }
+            }
+
+            // Only while a take is on the air: the audio thread is still
+            // draining when the key comes up, and a level that arrived after
+            // that would re-redden an icon which has already gone idle.
+            #[cfg(not(target_os = "linux"))]
+            Event::UserEvent(Wake::Level(step)) => {
+                if let Some(shown) = status.as_mut() {
+                    if shown.is_recording() {
+                        shown.set_mood(tray::Mood::Recording(step));
+                    }
+                }
+            }
+
+            #[cfg(not(target_os = "linux"))]
+            Event::UserEvent(Wake::Transcript(text)) => {
+                if let Some(shown) = status.as_mut() {
+                    shown.set_transcript(&text);
+                }
+            }
+
+            #[cfg(not(target_os = "linux"))]
+            Event::UserEvent(Wake::Health(headline)) => {
+                if let Some(shown) = status.as_mut() {
+                    shown.set_health(headline);
                 }
             }
             Event::UserEvent(Wake::Hotkey(HotkeyEdge::Released)) => {
@@ -184,11 +292,38 @@ fn run() -> Result<()> {
             // the only reason `LoopDestroyed` below ever runs. Without it the
             // hotkey registration outlives the process's own shutdown path.
             #[cfg(not(target_os = "linux"))]
-            Event::UserEvent(Wake::Menu(id)) => {
-                if tray::is_quit(&id) {
-                    *flow = ControlFlow::Exit;
+            Event::UserEvent(Wake::Menu(id)) => match tray::ask(&id) {
+                tray::Ask::Quit => *flow = ControlFlow::Exit,
+
+                tray::Ask::CopyTranscript => {
+                    if let Some(shown) = status.as_ref() {
+                        shown.copy_transcript();
+                    }
                 }
-            }
+
+                tray::Ask::RevealLog => tray::reveal_log(),
+
+                tray::Ask::ToggleAutostart => {
+                    let want = !setting.launch_at_login;
+                    match autostart::set(want) {
+                        Ok(()) => {
+                            setting.launch_at_login = want;
+                            if let Err(error) = setting.save() {
+                                eprintln!("splaude: could not save the setting: {error}");
+                            }
+                        }
+                        Err(error) => eprintln!("splaude: {error:#}"),
+                    }
+                    // Redrawn from the machine rather than from the intent: a
+                    // checked box over an entry that was never written is a
+                    // promise the app will not keep at the next login.
+                    if let Some(shown) = status.as_mut() {
+                        shown.set_autostart(autostart::is_enabled());
+                    }
+                }
+
+                tray::Ask::Ignore => {}
+            },
 
             Event::LoopDestroyed => {
                 if let Some(running) = take.take() {
@@ -203,6 +338,42 @@ fn run() -> Result<()> {
             _ => {}
         }
     })
+}
+
+/// The callbacks for one take, wired to the tray through the event loop.
+///
+/// Fresh per take because the level filter carries state: the last step it
+/// pushed, which has to start from "nothing yet" so the first buffer of a new
+/// take always lands.
+#[cfg(not(target_os = "linux"))]
+fn report(
+    level: &tao::event_loop::EventLoopProxy<Wake>,
+    transcript: &tao::event_loop::EventLoopProxy<Wake>,
+) -> Report {
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    let level = level.clone();
+    let transcript = transcript.clone();
+    // Atomic rather than a `Cell` because the audio callback hands out `Fn`,
+    // not `FnMut`, and it runs on a thread neither the loop nor this function
+    // owns. `u8::MAX` is not a step, so the first buffer always reports.
+    let last = AtomicU8::new(u8::MAX);
+
+    Report {
+        level: Box::new(move |reading| {
+            // The whole point of the filter: the audio thread calls this
+            // hundreds of times a second and each step costs a rasterised
+            // 32x32 bitmap plus a platform icon swap, so only a change of step
+            // is worth waking the loop for.
+            let step = tray::step_of(reading);
+            if last.swap(step, Ordering::Relaxed) != step {
+                let _ = level.send_event(Wake::Level(step));
+            }
+        }),
+        transcript: Box::new(move |text| {
+            let _ = transcript.send_event(Wake::Transcript(text));
+        }),
+    }
 }
 
 /// Headless diagnostic. Opens no window and starts no take, so it is safe to

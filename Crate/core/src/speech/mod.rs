@@ -10,6 +10,8 @@ pub mod anthropic;
 
 pub use anthropic::AnthropicSpeechBackend;
 
+use std::time::Duration;
+
 use tokio::sync::mpsc;
 
 /// Audio contract the capture stage must satisfy.
@@ -26,6 +28,25 @@ impl SpeechAudioFormat {
         sample_rate: 16_000,
         channel_count: 1,
     };
+
+    /// Bytes one second of this format occupies. Signed 16-bit, so two bytes
+    /// per sample per channel.
+    pub const fn byte_rate(&self) -> u64 {
+        self.sample_rate as u64 * self.channel_count as u64 * 2
+    }
+
+    /// How long `byte_count` bytes of this format take to speak.
+    ///
+    /// Exact rather than approximate: the encoding is fixed-width, so a byte
+    /// count converts to a duration with no guessing. Anything reasoning about
+    /// whether audio reached a server faster than it was spoken needs this.
+    pub fn duration_of(&self, byte_count: usize) -> Duration {
+        let rate = self.byte_rate();
+        if rate == 0 {
+            return Duration::ZERO;
+        }
+        Duration::from_nanos(byte_count as u64 * 1_000_000_000 / rate)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -128,6 +149,20 @@ impl TranscriptBuffer {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn a_byte_count_converts_to_the_time_it_takes_to_speak() {
+        let format = SpeechAudioFormat::LINEAR16_16K;
+        assert_eq!(format.byte_rate(), 32_000);
+        assert_eq!(format.duration_of(32_000), Duration::from_secs(1));
+        assert_eq!(format.duration_of(1_024), Duration::from_micros(32_000));
+        assert_eq!(format.duration_of(0), Duration::ZERO);
+        // The size the truncation bug was first seen at: ~3.2 s in one burst.
+        assert_eq!(
+            format.duration_of(103_360),
+            Duration::from_micros(3_230_000)
+        );
+    }
 
     #[test]
     fn an_interim_does_not_commit() {

@@ -20,11 +20,24 @@ path = "src/main.rs"
 # locating one across MSVC, GNU and cross builds is the whole of what this crate
 # does.
 #
-# Host-gated rather than target-gated, because Cargo resolves a target-specific
-# build dependency against the *host*: a Linux or macOS machine never sees it,
-# and the no-op in `build.rs` covers the remaining case of a Windows host
-# building for something else.
-[target.'cfg(windows)'.build-dependencies]
+# Deliberately not gated, and the reason is the same host-versus-target trap
+# that `build.rs` documents at its guard.
+#
+# `[target.'cfg(windows)'.build-dependencies]` reads as "only on Windows", but
+# Cargo resolves a build dependency's `cfg` against the **host** — so on a Linux
+# or macOS leg the crate is absent while `build.rs` still names it, and the
+# script fails to compile before its target check can decide anything. The guard
+# has to live in the script, where `CARGO_CFG_TARGET_OS` can answer for the
+# machine that will run the binary.
+#
+# Unconditional also buys the case gating would have broken outright: building
+# for Windows *from* Linux, which is how a release matrix could reasonably work
+# and where a host gate would silently drop the icon.
+#
+# The cost is that a Linux or macOS host compiles a crate it will not call.
+# `winresource` is build-only — it never reaches the runtime graph, the shipped
+# binary, or the Linux dependency question the tray is gated over.
+[build-dependencies]
 winresource = "0.1.31"
 
 [dependencies]

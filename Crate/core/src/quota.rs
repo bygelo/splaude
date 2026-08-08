@@ -125,22 +125,48 @@ pub fn record<'a>(status: u16, header: impl IntoIterator<Item = (&'a str, &'a st
     }
 }
 
-/// One-line answer for the settings window.
-pub fn summary() -> String {
+/// What this run has learned about metering, as a value rather than a sentence.
+///
+/// The three real answers are genuinely different claims and flattening them
+/// would be a lie in one direction or the other: "we asked and the endpoint
+/// reported no rate limit" is the evidence the README's central claim rests on,
+/// and "we have not asked yet" is not evidence of anything.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Reading {
+    /// No handshake has completed this run, so nothing has been observed.
+    Unknown,
+    /// A handshake completed and answered with no rate-limit header at all.
+    Unmetered,
+    /// The endpoint reported a rate limit. Carries the readings, joined.
+    Metered(String),
+    /// The shared state could not be read.
+    Unavailable,
+}
+
+impl Reading {
+    /// One line for a menu item or the `--check` report.
+    pub fn line(&self) -> String {
+        match self {
+            Reading::Unknown => "dictate once to check".into(),
+            Reading::Unmetered => "nothing metered (no rate-limit header)".into(),
+            Reading::Metered(what) => what.clone(),
+            Reading::Unavailable => "unavailable".into(),
+        }
+    }
+}
+
+/// What the last handshake said.
+pub fn reading() -> Reading {
     let Ok(held) = state().lock() else {
-        return "unavailable".into();
+        return Reading::Unavailable;
     };
 
-    if held.last_header.is_empty() && !held.saw_rate_limit_header {
-        return if held.ever_connected {
-            "none seen".into()
-        } else {
-            "dictate once to check".into()
-        };
-    }
-
     if !held.saw_rate_limit_header {
-        return "none seen".into();
+        return if held.ever_connected {
+            Reading::Unmetered
+        } else {
+            Reading::Unknown
+        };
     }
 
     let mut line: Vec<String> = held
@@ -150,7 +176,12 @@ pub fn summary() -> String {
         .map(|(name, value)| format!("{name}={value}"))
         .collect();
     line.sort();
-    line.join(", ")
+    Reading::Metered(line.join(", "))
+}
+
+/// One-line answer for the interface.
+pub fn summary() -> String {
+    reading().line()
 }
 
 #[cfg(test)]
@@ -180,6 +211,40 @@ mod test {
         assert_eq!(capture.summary(), "none seen");
         // The point of the whole module: this is the evidence nothing metered.
         assert_eq!(capture.seen, vec!["server", "upgrade"]);
+    }
+
+    /// The distinction the whole type exists for. Never having asked is not the
+    /// same claim as having asked and seen nothing, and the interface has to say
+    /// which one it means — the second is evidence, the first is silence.
+    #[test]
+    fn never_asked_and_asked_and_saw_nothing_read_differently() {
+        assert_ne!(Reading::Unknown.line(), Reading::Unmetered.line());
+        assert_eq!(Reading::Unknown.line(), "dictate once to check");
+        assert!(
+            Reading::Unmetered.line().contains("nothing metered"),
+            "{}",
+            Reading::Unmetered.line()
+        );
+    }
+
+    #[test]
+    fn a_metered_reading_shows_the_header_it_read() {
+        let reading = Reading::Metered("anthropic-ratelimit-requests-remaining=42".into());
+        assert_eq!(reading.line(), "anthropic-ratelimit-requests-remaining=42");
+    }
+
+    #[test]
+    fn every_reading_says_something() {
+        // A blank menu item reads as a broken app, so no variant may render
+        // empty — including the one nobody expects to see.
+        for reading in [
+            Reading::Unknown,
+            Reading::Unmetered,
+            Reading::Metered("x=1".into()),
+            Reading::Unavailable,
+        ] {
+            assert!(!reading.line().is_empty(), "{reading:?}");
+        }
     }
 
     #[test]

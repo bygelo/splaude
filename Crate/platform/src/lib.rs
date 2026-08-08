@@ -16,6 +16,8 @@
 //! | Injection    | `enigo`         | SendInput | `CGEvent`    | XTest / uinput     |
 //! | Focus guard  | this crate      | real      | not yet      | not possible       |
 //! | Autostart    | this crate      | registry  | LaunchAgent  | XDG autostart      |
+//! | Return watch | this crate      | `WH_KEYBOARD_LL` | in the Swift app | none       |
+//! | Start/stop tone | `cpal`       | WASAPI    | CoreAudio    | ALSA / PipeWire    |
 //!
 //! # Wayland
 //!
@@ -32,11 +34,14 @@ pub mod focus;
 pub mod hotkey;
 pub mod injector;
 pub mod resample;
+pub mod submit;
+pub mod tone;
 
 pub use audio::Capture;
 pub use focus::FocusVerdict;
 pub use hotkey::{HotkeyEdge, HotkeyListener};
 pub use injector::Injector;
+pub use tone::Tone;
 
 /// What the current session actually permits, established at startup so the UI
 /// can say so up front rather than after a take produces nothing.

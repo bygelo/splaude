@@ -35,6 +35,48 @@ pub const BUILTIN_KEYTERM: [&str; 18] = [
     "worktree",
 ];
 
+/// Applications that re-encode a keystroke by its keycode instead of reading
+/// the unicode payload it carries.
+///
+/// Synthetic text is delivered as a keystroke on virtual key 0 whose payload is
+/// the codepoint itself — `KEYEVENTF_UNICODE` on Windows, `keyboardSetUnicode
+/// String` on macOS. That is what makes typing layout-independent, and every
+/// native app reads it. A remote-desktop or VM client does not: it re-encodes
+/// keyboard input into scancodes to ship to the far end, reads the keycode, and
+/// sends whatever key 0 happens to be — on macOS that is `kVK_ANSI_A`, which is
+/// why a take dictated into a Remote Desktop window arrives as a run of `a`.
+///
+/// Windows executable names, because the window class is useless here: these
+/// apps render into one opaque HWND like every other framework does, so the
+/// class says nothing about what is behind it. Compared case-insensitively and
+/// without the extension — the Windows filesystem is case-insensitive, and a
+/// user writing this list by hand should not have to guess the capitalisation.
+pub const BUILTIN_KEYCODE_APP: [&str; 14] = [
+    // Microsoft: the classic Remote Desktop Connection, the newer client that
+    // ships with Windows App / Azure Virtual Desktop, and Hyper-V's console.
+    "mstsc.exe",
+    "msrdc.exe",
+    "vmconnect.exe",
+    // Citrix: the ICA engine that owns the session window, and the Desktop
+    // Viewer chrome wrapped around it.
+    "wfica32.exe",
+    "CDViewer.exe",
+    // VMware Workstation's VM console, and the Horizon view client.
+    "vmware.exe",
+    "vmware-view.exe",
+    // VirtualBox runs each machine's window in its own process.
+    "VirtualBoxVM.exe",
+    // VNC viewers. The protocol carries keysyms, but the clients still read the
+    // keycode off the event to work out what to send.
+    "vncviewer.exe",
+    "tvnviewer.exe",
+    // General-purpose remote control.
+    "TeamViewer.exe",
+    "AnyDesk.exe",
+    "rustdesk.exe",
+    "parsecd.exe",
+];
+
 /// Supported by the recogniser; the wire accepts any BCP-47 tag, these are just
 /// the ones worth putting in a menu.
 pub const AVAILABLE_LANGUAGE: [(&str, &str); 15] = [
@@ -217,6 +259,11 @@ pub struct Setting {
     /// search field the next words would land somewhere you cannot see. Worth
     /// turning off when dictating prose, where Return is just a new paragraph.
     pub stop_on_return: bool,
+    /// Executables the user added to [`BUILTIN_KEYCODE_APP`]. Kept separate for
+    /// the same reason `custom_keyterm` is: adding one must never cost the
+    /// built-ins.
+    pub custom_keycode_app: Vec<String>,
+    pub use_builtin_keycode_app: bool,
     /// Pin a take to the field it started in, rather than following focus.
     ///
     /// Off means keystrokes go wherever focus is when they are posted, so
@@ -248,6 +295,8 @@ impl Default for Setting {
             typing_interval: 1_200,
             guard_focus: true,
             stop_on_return: true,
+            custom_keycode_app: Vec::new(),
+            use_builtin_keycode_app: true,
             anchor_input: true,
             show_floating_button: true,
             floating_button_point: None,
@@ -255,6 +304,20 @@ impl Default for Setting {
             hotkey: Hotkey::default(),
             launch_at_login: false,
         }
+    }
+}
+
+/// An executable name reduced to what is worth comparing.
+///
+/// Strips the `.exe`, because a user writing this list by hand will leave it off
+/// as often as not and both spellings mean the same process. Case is left to the
+/// caller's `eq_ignore_ascii_case`, which is the right comparison on Windows —
+/// `MSTSC.EXE` and `mstsc.exe` are one file there.
+fn bare_executable(name: &str) -> &str {
+    let name = name.trim();
+    match name.len().checked_sub(4) {
+        Some(stem) if name[stem..].eq_ignore_ascii_case(".exe") => &name[..stem],
+        _ => name,
     }
 }
 
@@ -270,6 +333,38 @@ impl Setting {
             Vec::new()
         };
         [builtin, self.custom_keyterm.clone()].concat()
+    }
+
+    /// Every executable that is known to re-encode keystrokes by keycode.
+    ///
+    /// Composed exactly like [`Setting::keyterm`]: built-ins first, then the
+    /// user's own, so turning the built-ins off is a deliberate act rather than
+    /// a side effect of adding an entry.
+    pub fn keycode_app(&self) -> Vec<String> {
+        let builtin = if self.use_builtin_keycode_app {
+            BUILTIN_KEYCODE_APP
+                .iter()
+                .map(|name| name.to_string())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        [builtin, self.custom_keycode_app.clone()].concat()
+    }
+
+    /// Whether `executable` names an application that would turn our unicode
+    /// keystrokes into the wrong characters.
+    ///
+    /// Pure over the name, so the whole carve-out is testable with no desktop,
+    /// no focused window and no remote-desktop session.
+    pub fn is_keycode_app(&self, executable: &str) -> bool {
+        let name = bare_executable(executable);
+        if name.is_empty() {
+            return false;
+        }
+        self.keycode_app()
+            .iter()
+            .any(|known| bare_executable(known).eq_ignore_ascii_case(name))
     }
 
     /// `%APPDATA%\splaude\setting.json`, `~/Library/Application Support/…`,
@@ -423,6 +518,81 @@ mod test {
             ..Setting::default()
         };
         assert_eq!(setting.keyterm(), vec!["splaude".to_string()]);
+    }
+
+    #[test]
+    fn the_builtin_remote_desktop_client_is_a_keycode_app() {
+        let setting = Setting::default();
+        assert!(setting.is_keycode_app("mstsc.exe"));
+        assert!(setting.is_keycode_app("msrdc.exe"));
+        assert!(setting.is_keycode_app("VirtualBoxVM.exe"));
+    }
+
+    #[test]
+    fn an_ordinary_app_is_left_alone() {
+        // The carve-out must stay a carve-out: everything else still gets live
+        // typing exactly as before.
+        let setting = Setting::default();
+        for name in [
+            "Code.exe",
+            "notepad.exe",
+            "chrome.exe",
+            "WindowsTerminal.exe",
+            "slack.exe",
+            "",
+            "   ",
+            // Not a prefix or substring match — only the whole name counts.
+            "mstscd.exe",
+            "notmstsc.exe",
+        ] {
+            assert!(!setting.is_keycode_app(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn keycode_app_matching_ignores_case_and_the_extension() {
+        // Windows filenames are case-insensitive, and a hand-written list will
+        // spell them however the user remembers them.
+        let setting = Setting::default();
+        for name in ["MSTSC.EXE", "MsTsC.exe", "mstsc", "  mstsc.exe  "] {
+            assert!(setting.is_keycode_app(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn keycode_app_is_builtin_plus_custom() {
+        let setting = Setting {
+            custom_keycode_app: vec!["Ericom.exe".into()],
+            ..Setting::default()
+        };
+        assert_eq!(
+            setting.keycode_app().len(),
+            BUILTIN_KEYCODE_APP.len() + 1,
+            "adding one must not cost the built-ins"
+        );
+        assert!(setting.is_keycode_app("ericom.exe"));
+        assert!(setting.is_keycode_app("mstsc.exe"));
+    }
+
+    #[test]
+    fn builtin_keycode_app_can_be_turned_off_without_losing_custom() {
+        let setting = Setting {
+            custom_keycode_app: vec!["Ericom.exe".into()],
+            use_builtin_keycode_app: false,
+            ..Setting::default()
+        };
+        assert_eq!(setting.keycode_app(), vec!["Ericom.exe".to_string()]);
+        assert!(setting.is_keycode_app("Ericom.exe"));
+        assert!(!setting.is_keycode_app("mstsc.exe"));
+    }
+
+    #[test]
+    fn a_file_written_before_the_keycode_carve_out_still_loads() {
+        // `serde(default)` is what keeps an existing setting.json working.
+        let setting: Setting = serde_json::from_str(r#"{"language":"ja"}"#).unwrap();
+        assert!(setting.use_builtin_keycode_app);
+        assert!(setting.custom_keycode_app.is_empty());
+        assert!(setting.is_keycode_app("mstsc.exe"));
     }
 
     #[test]

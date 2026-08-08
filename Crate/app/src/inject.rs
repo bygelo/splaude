@@ -16,8 +16,21 @@ use splaude_platform::Injector;
 /// One edit, already decided by `splaude_core::Typer`.
 #[derive(Debug)]
 pub enum Command {
-    Backspace { count: usize, interval_micros: u32 },
-    Type { text: String, interval_micros: u32 },
+    Backspace {
+        count: usize,
+        interval_micros: u32,
+    },
+    Type {
+        text: String,
+        interval_micros: u32,
+    },
+    /// Deliver via the clipboard and a real paste chord, for an application
+    /// that would mistranslate synthetic text. Carries the typing interval only
+    /// so the fallback below has one when the paste does not go through.
+    Paste {
+        text: String,
+        interval_micros: u32,
+    },
 }
 
 /// Starts the injector thread. Dropping the returned sender ends it.
@@ -42,6 +55,24 @@ pub fn spawn() -> Result<Sender<Command>> {
                         text,
                         interval_micros,
                     } => injector.type_text(&text, interval_micros),
+
+                    // Typing is the wrong delivery for this application — that
+                    // is why the command exists — but wrong text beats no text,
+                    // and a clipboard the OS refuses to hand over must not cost
+                    // the user the take.
+                    Command::Paste {
+                        text,
+                        interval_micros,
+                    } => match injector.paste(&text) {
+                        Ok(()) => Ok(()),
+                        Err(error) => {
+                            splaude_core::diagnostic::log(
+                                "type",
+                                format!("paste failed, typing instead: {error:#}"),
+                            );
+                            injector.type_text(&text, interval_micros)
+                        }
+                    },
                 };
 
                 // A failed keystroke loses a word; a panicking thread loses

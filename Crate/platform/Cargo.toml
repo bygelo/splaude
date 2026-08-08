@@ -15,6 +15,20 @@ enigo = "0.6"
 global-hotkey = "0.8.0"
 splaude-core = { version = "0.2.0", path = "../core" }
 
+# Windows and macOS only, deliberately. The only thing here that touches the
+# clipboard is `Injector::paste`, and its only caller is the carve-out for
+# applications that re-encode keystrokes by keycode — which is gated on
+# `focus::executable`, and that answers `None` on Linux. So the Linux build
+# would carry an X11 clipboard owner it can never reach; `paste` returns a
+# clear error there instead.
+#
+# `default-features = false` drops `image-data`, which would otherwise bring the
+# whole `image` crate in to support a clipboard format this app never puts
+# anything but text on. It also bounds what the paste path can put back: text
+# only, so a snapshot of an image or a file list is not recoverable.
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+arboard = { version = "3.6.1", default-features = false }
+
 [target."cfg(windows)".dependencies]
-windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
 winreg = "0.56.0"

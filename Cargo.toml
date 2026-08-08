@@ -1,0 +1,10 @@
+[workspace]
+resolver = "2"
+members = ["Crate/core", "Crate/platform", "Crate/app"]
+
+[workspace.package]
+version = "0.2.0"
+edition = "2021"
+rust-version = "1.90"
+license = "MIT"
+repository = "https://github.com/bygelo/splaude"

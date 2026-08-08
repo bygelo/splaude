@@ -10,9 +10,13 @@ Neither did I — until a spent weekly limit left the mic button in the IDE
 extension still working. It turns out that button talks to a speech endpoint
 that never touches a Claude model, which is why the limit did not apply.
 
-splaude points a macOS menu bar app at the same endpoint. Hold a hotkey, talk,
+splaude points a menu bar app at the same endpoint. Hold a hotkey, talk,
 release — the text lands at your cursor in whatever app you were typing in, and
 it appears **as you speak** rather than after you stop.
+
+macOS is what ships. A Rust rewrite in `Crate/` targets Windows, Linux and
+macOS from one codebase; Windows dictates end to end today, Linux and macOS
+compile but have not been launched. See [docs/PORTING.md](docs/PORTING.md).
 
 It authenticates with the Claude Code OAuth credential already on this machine,
 so if you have run `claude` once, there is nothing else to set up.
@@ -27,6 +31,8 @@ so if you have run `claude` once, there is nothing else to set up.
 > is a three-method protocol — swapping in your own Deepgram key is one file.
 
 ## Install
+
+### macOS
 
 Grab the latest zip from [Releases](https://github.com/bygelo/splaude/releases),
 drag `splaude.app` to `/Applications`, then:
@@ -44,11 +50,24 @@ a new app, so expect to grant Accessibility again after upgrading.
 
 Building from source avoids both problems if you have a signing identity.
 
+### Windows
+
+Download `splaude.exe` from [Releases](https://github.com/bygelo/splaude/releases)
+and run it. It is unsigned, so SmartScreen will interpose once — *More info* →
+*Run anyway*. splaude puts an icon in the notification area; Windows hides new
+icons by default, so drag it out of the `^` overflow to keep it in view.
+
+The binding is `F9`, not macOS's `⌥/` — Windows cannot deliver a modified
+binding safely, and the reason is worth reading before you change it
+([CHANGELOG](CHANGELOG.md)). `splaude.exe --check` reports credential,
+capability, quota and settings state without opening a window or a microphone.
+
 ## Requirement
 
-- macOS 14+, Apple Silicon
+- macOS 14+ (Apple Silicon), or Windows 10+
 - A signed-in Claude Code install (`claude` in a terminal at least once)
-- To build rather than download: Xcode command line tools (Swift 6)
+- To build rather than download: Xcode command line tools (Swift 6) for the
+  macOS app, or Rust 1.90+ for the cross-platform binary
 
 ## Build
 
@@ -70,6 +89,17 @@ a stale registration and the next launch fails with `-600`.
 
 To launch at login, add `/Applications/splaude.app` under
 System Settings › General › Login Items.
+
+## Repository layout
+
+| Path | What it is |
+| --- | --- |
+| `Source/`, `Package.swift`, `Makefile` | The macOS app — this is what ships |
+| `Crate/`, `Cargo.toml` | A Rust workspace targeting Windows, Linux and macOS. Builds the `splaude` binary that ships on Windows — see [docs/PORTING.md](docs/PORTING.md) |
+| `Script/` | Icon and banner renderers |
+
+`cargo test` runs the Rust workspace; it has no bearing on the macOS build,
+which is built with `make` as above.
 
 ## Use
 
@@ -203,6 +233,8 @@ minutes, and read it again — the number should not move.
 
 ## Settings
 
+### macOS
+
 Menu bar › **Settings…** (`⌘,`), in four tabs:
 
 | Tab | What's there |
@@ -224,6 +256,36 @@ defaults write com.bygelo.splaude typingInterval -int 600   # µs between keystr
 take and pasting it in one go — slower to appear, but it never touches the
 delete key, which is the safer choice in an app that mishandles synthetic
 keystrokes.
+
+### Windows
+
+There is no settings window yet. Settings are a JSON file, and the tray menu
+opens it (**Edit Settings…**) and re-reads it (**Reload Settings**) without a
+restart:
+
+```
+%APPDATA%\splaude\setting.json
+```
+
+```json
+{
+  "hotkey": "F9",
+  "liveTyping": true,
+  "language": "en",
+  "customKeyterm": ["Ateneo", "OrSem", "Supabase"],
+  "launchAtLogin": true
+}
+```
+
+`hotkey` is written the way the menu shows it — `F9`, `Ctrl+Shift+KeyD` — using
+[W3C key codes](https://www.w3.org/TR/uievents-code/), so a binding lands on
+the same physical key under any layout. A file that fails to parse is reported
+in the log, in `--check` and in the menu, and is never overwritten.
+
+`customKeycodeApp` extends the list of applications splaude pastes into rather
+than types at — remote desktop and VM clients, which read the keycode off a
+synthetic keystroke instead of the character it carries and would otherwise
+turn a whole take into a run of `a`.
 
 Live typing also sets `forward_interims=typed` on the connection, which asks
 the server to punctuate and case interim results as they stream rather than

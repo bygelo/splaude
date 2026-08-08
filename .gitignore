@@ -6,5 +6,8 @@ Package.resolved
 # Build output
 build/
 
+# Rust
+target/
+
 # macOS
 .DS_Store

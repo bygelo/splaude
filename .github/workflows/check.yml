@@ -54,6 +54,25 @@ jobs:
       - name: Test
         run: cargo test --all
 
+      # The suite never runs the binary — it links the crates and calls into
+      # them. `release.yml` does run it, as a hard step with no fallback, so
+      # until this existed the first execution of `splaude` on Linux happened
+      # after a tag was already pushed and every artifact was already built.
+      #
+      # `--check` is the right probe because it is the one path that opens no
+      # window and starts no take: on Linux it reads environment variables and
+      # a credential file, and `focus::executable` answers `None` rather than
+      # reaching for a display. If that ever stops being true, this fails on
+      # the push that broke it instead of during a release.
+      #
+      # Debug, not release: the failure this guards against is a platform one —
+      # a display connection, a missing library, a panic in a probe — and none
+      # of it turns on the optimization level. A release build here would
+      # recompile the whole dependency graph a second time on three runners to
+      # learn the same thing.
+      - name: Smoke test
+        run: cargo run -p splaude-app -- --check
+
   swift:
     name: Swift — macOS
     # arm64 image with Xcode 16, which is what Swift 6 needs.

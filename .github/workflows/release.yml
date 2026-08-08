@@ -15,15 +15,18 @@ permissions:
   contents: write
 
 jobs:
-  release:
-    # arm64 image with Xcode 16, which is what Swift 6 needs.
-    runs-on: macos-15
+  # Resolved once and consumed by every downstream job. It was inline in the
+  # release job while that job was the only one; with the Rust matrix also
+  # naming files after it, two copies of the same five lines would eventually
+  # drift and ship a zip and a tarball claiming different versions.
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
 
     steps:
-      - uses: actions/checkout@v4
-
       - name: Resolve version
-        id: version
+        id: resolve
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             version="${{ inputs.version }}"
@@ -32,6 +35,130 @@ jobs:
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "building $version"
+
+  # The Rust port, built for the platforms where it is the only thing to run.
+  #
+  # macOS is deliberately absent. The Swift .app is what macOS users are told
+  # to install, and the Rust build is worse there specifically: it reads the
+  # Claude Code credential from the file only, not the Keychain, and an
+  # unbundled binary has no TCC identity of its own, so Accessibility and
+  # Microphone would be granted to whichever terminal launched it. Shipping it
+  # beside the .app would only make people choose between a good download and a
+  # degraded one. `check.yml` still builds and tests the crate on macOS, so the
+  # port does not rot there unnoticed — it just is not a download.
+  binary:
+    name: Binary — ${{ matrix.platform }}
+    needs: version
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # One platform failing is the interesting case, so let the others finish
+      # rather than cancelling them.
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux-x86_64
+            exe: ""
+          - os: windows-latest
+            platform: windows-x86_64
+            exe: ".exe"
+
+    # Git Bash is on the Windows image, so one script covers every platform
+    # rather than a pwsh variant of each step.
+    defaults:
+      run:
+        shell: bash
+
+    env:
+      # Strips symbols without touching Cargo.toml — a `[profile.release]`
+      # there would also strip every local `cargo build --release`, which is
+      # exactly the build someone wants a backtrace out of.
+      RUSTFLAGS: "-C strip=symbols"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # cpal needs ALSA, enigo needs libxdo, and the hotkey listener needs the
+      # X11 and xkb headers. GTK and D-Bus come from `tao`, the event loop —
+      # not from the tray, which is excluded on Linux. None ship on the image.
+      - name: Install Linux audio, input and windowing headers
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            pkg-config libasound2-dev libxdo-dev libxkbcommon-dev libx11-dev \
+            libgtk-3-dev libdbus-1-dev
+
+      - name: Report toolchain
+        run: |
+          rustc --version
+          cargo --version
+
+      # No rust-cache here on purpose. A release binary is the one build worth
+      # doing from cold, and `check.yml` already carries the cache for the fast
+      # feedback loop this job is not part of.
+      - name: Build
+        run: cargo build --release -p splaude-app
+
+      # The tag names the download but `--version` reports CARGO_PKG_VERSION,
+      # so a tag cut ahead of a version bump ships a binary that disagrees with
+      # its own filename. Warned rather than failed: a workflow_dispatch
+      # rebuild of an older version is a legitimate reason to differ.
+      - name: Compare the reported version against the tag
+        run: |
+          crate=$(./target/release/splaude${{ matrix.exe }} --version | awk '{print $2}')
+          tag="${{ needs.version.outputs.version }}"
+          if [ "$crate" != "$tag" ]; then
+            echo "::warning::releasing as $tag but the binary reports $crate"
+          fi
+
+      # A headless smoke test: --check exercises credential lookup and the
+      # capability probe without opening any UI. There is no Claude Code
+      # credential on a runner and no display on the Linux one, which is
+      # precisely the state --check exists to survive — it reports what is
+      # missing and still exits 0. A binary that cannot get this far is worse
+      # than no download at all, so it is tested before it is packaged.
+      - name: Smoke test
+        run: |
+          ./target/release/splaude${{ matrix.exe }} --check
+          echo "exit $?"
+
+      # Windows ships the .exe bare: it is a single self-contained file, and
+      # asking someone to unzip a one-file archive before they can run it is
+      # friction for nothing. Linux ships a tarball because a plain download
+      # arrives without the executable bit, and tar is what carries it.
+      - name: Package
+        id: package
+        run: |
+          version="${{ needs.version.outputs.version }}"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            name="splaude-$version-${{ matrix.platform }}.exe"
+            cp target/release/splaude.exe "$name"
+          else
+            name="splaude-$version-${{ matrix.platform }}.tar.gz"
+            tar -C target/release -czf "$name" splaude
+          fi
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          # Carried as a file rather than a job output: matrix legs cannot each
+          # contribute an output, and the release job needs all of them.
+          echo "$(sha256sum "$name" | cut -d' ' -f1)  $name" > "$name.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.platform }}
+          path: |
+            ${{ steps.package.outputs.name }}
+            ${{ steps.package.outputs.name }}.sha256
+          if-no-files-found: error
+
+  release:
+    # arm64 image with Xcode 16, which is what Swift 6 needs.
+    runs-on: macos-15
+    # Everything lands on one release, so the job that creates it goes last.
+    needs: [version, binary]
+
+    steps:
+      - uses: actions/checkout@v4
 
       - name: Report toolchain
         run: swift --version
@@ -43,7 +170,7 @@ jobs:
         run: |
           plist=Resource/Info.plist
           /usr/libexec/PlistBuddy -c \
-            "Set :CFBundleShortVersionString ${{ steps.version.outputs.version }}" "$plist"
+            "Set :CFBundleShortVersionString ${{ needs.version.outputs.version }}" "$plist"
           /usr/libexec/PlistBuddy -c \
             "Set :CFBundleVersion ${{ github.run_number }}" "$plist"
 
@@ -75,17 +202,38 @@ jobs:
       - name: Package
         id: package
         run: |
-          name="splaude-${{ steps.version.outputs.version }}.zip"
+          name="splaude-${{ needs.version.outputs.version }}.zip"
           ditto -c -k --sequesterRsrc --keepParent build/splaude.app "$name"
           echo "name=$name" >> "$GITHUB_OUTPUT"
           echo "sha=$(shasum -a 256 "$name" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
 
+      # merge-multiple flattens every matrix leg into one directory, so the
+      # publish step can glob rather than name each platform twice.
+      - name: Collect the Rust binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: binary-*
+          merge-multiple: true
+          path: dist
+
       - name: Write release notes
         run: |
           cat > NOTE.md <<'EOF'
-          Menu bar push-to-talk dictation for macOS.
+          Push-to-talk dictation. A menu bar app on macOS, a background app on
+          Windows and Linux.
 
-          ## Install
+          ## Which download
+
+          | File | For |
+          | --- | --- |
+          | `splaude-<version>.zip` | **macOS** — the menu bar app. Apple Silicon, macOS 14+. |
+          | `splaude-<version>-windows-x86_64.exe` | **Windows** — run it directly, no unzip. |
+          | `splaude-<version>-linux-x86_64.tar.gz` | **Linux** — X11 session, glibc. |
+
+          There is no Rust build for macOS on purpose: the `.app` above is the
+          macOS app, and a second macOS download would only be a worse one.
+
+          ## Install — macOS
 
           1. Unzip and drag **splaude.app** to `/Applications`
           2. Clear the quarantine flag, then open it:
@@ -103,14 +251,39 @@ jobs:
           release, so macOS treats each update as a new app: expect to grant
           Accessibility again after upgrading.
 
+          ## Install — Windows
+
+          Put the `.exe` somewhere it will stay — `%LOCALAPPDATA%\Programs\` is
+          a good home — and run it from there. Where it lives matters: "Launch
+          at login" registers the path you ran it from, so launching it out of
+          a downloads folder or a `target\` directory breaks the next time that
+          folder is cleared.
+
+          It is unsigned, so SmartScreen will interrupt the first launch:
+          **More info** then **Run anyway**.
+
+          ## Install — Linux
+
+          ```sh
+          tar xzf splaude-<version>-linux-x86_64.tar.gz
+          install -Dm755 splaude ~/.local/bin/splaude
+          ```
+
+          Needs an X11 session — Wayland does not let a background app register
+          a global hotkey or type into another window. Run `splaude --check`;
+          it says so if that is the problem. Runtime libraries: ALSA, libxdo,
+          libxkbcommon, X11 and GTK3.
+
           ## First run
 
           It needs a signed-in Claude Code install — run `claude` in a terminal
-          once if you have not. Three grants are prompted: Microphone,
+          once if you have not. On macOS three grants are prompted: Microphone,
           Accessibility, and Keychain access to the Claude Code credential
           (choose **Always Allow** so it stops asking).
 
-          Requires macOS 14+ on Apple Silicon.
+          `splaude --check` reports credential, permission and device state and
+          exits without opening anything — start there if a take produces no
+          text.
 
           ## Verify the download
 
@@ -118,6 +291,7 @@ jobs:
           {
             echo '```'
             echo "${{ steps.package.outputs.sha }}  ${{ steps.package.outputs.name }}"
+            cat dist/*.sha256
             echo '```'
           } >> NOTE.md
 
@@ -125,7 +299,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "v${{ steps.version.outputs.version }}" \
+          gh release create "v${{ needs.version.outputs.version }}" \
             "${{ steps.package.outputs.name }}" \
-            --title "splaude ${{ steps.version.outputs.version }}" \
+            dist/splaude-*.exe \
+            dist/splaude-*.tar.gz \
+            --title "splaude ${{ needs.version.outputs.version }}" \
             --notes-file NOTE.md

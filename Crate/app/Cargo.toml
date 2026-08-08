@@ -1,0 +1,64 @@
+[package]
+name = "splaude-app"
+description = "Wiring: tray, floating mic, settings, take lifecycle."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "splaude"
+path = "src/main.rs"
+
+# `winresource`, the maintained fork of `winres` (last released 2021), is the
+# only dependency here that is not needed at run time: it finds the Windows
+# SDK's `rc.exe` and links the compiled resource into the binary. That last step
+# is why it earns its place — the `.ico` itself is written by hand in
+# `build.rs`, with no image crate involved, but turning one into an
+# RT_GROUP_ICON inside a PE file means invoking a resource compiler, and
+# locating one across MSVC, GNU and cross builds is the whole of what this crate
+# does.
+#
+# Deliberately not gated, and the reason is the same host-versus-target trap
+# that `build.rs` documents at its guard.
+#
+# `[target.'cfg(windows)'.build-dependencies]` reads as "only on Windows", but
+# Cargo resolves a build dependency's `cfg` against the **host** — so on a Linux
+# or macOS leg the crate is absent while `build.rs` still names it, and the
+# script fails to compile before its target check can decide anything. The guard
+# has to live in the script, where `CARGO_CFG_TARGET_OS` can answer for the
+# machine that will run the binary.
+#
+# Unconditional also buys the case gating would have broken outright: building
+# for Windows *from* Linux, which is how a release matrix could reasonably work
+# and where a host gate would silently drop the icon.
+#
+# The cost is that a Linux or macOS host compiles a crate it will not call.
+# `winresource` is build-only — it never reaches the runtime graph, the shipped
+# binary, or the Linux dependency question the tray is gated over.
+[build-dependencies]
+winresource = "0.1.31"
+
+[dependencies]
+anyhow = "1.0.104"
+splaude-core = { version = "0.2.0", path = "../core" }
+splaude-platform = { version = "0.2.0", path = "../platform" }
+tao = "0.36.0"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+
+# Windows and macOS only, deliberately. On Linux `tray-icon` pulls GTK3 and
+# libappindicator as hard build- and run-time dependencies, which is a heavy
+# ask for a console dictation tool — and it still renders nothing on a desktop
+# with no appindicator host, which stock GNOME is. Linux tray support is a
+# separate decision, not an oversight.
+#
+# `arboard` follows the same gate for the same reason: the only thing that
+# copies is the tray's transcript item, so on Linux there is nothing to copy
+# from and no reason to pull an X11 clipboard owner into a headless build.
+# `default-features = false` drops `image-data`, which would otherwise bring
+# the whole `image` crate in to support a clipboard format this app never puts
+# anything but text on.
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+arboard = { version = "3.6.1", default-features = false }
+tray-icon = "0.24.2"

@@ -162,7 +162,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Decide once, up front, where this take is going.
         let focus = FocusProbe.current()
         let focusAllows = Setting.guardFocus ? focus.acceptsTyping : true
-        isTypingLive = Setting.liveTyping && TextInserter.isTrusted && focusAllows
+
+        // Remote-desktop and VM clients re-encode keystrokes by keycode, and
+        // LiveTyper's characters all ride on keycode 0. Classified here with
+        // everything else about the take, because the typer's model of the
+        // screen only holds if the delivery route cannot change mid-utterance.
+        let bundle = FocusProbe.frontmostBundleIdentifier
+        let retypesByKeycode = Setting.isPasteOnly(bundle)
+
+        isTypingLive = Setting.liveTyping && TextInserter.isTrusted && focusAllows && !retypesByKeycode
 
         // Remember the field as well as the decision, so the rest of the take
         // can be held back if the user wanders off mid-sentence.
@@ -172,7 +180,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         Diagnostic.session("record — \(FocusProbe.frontmostApp) / \(focus.label) → \(isTypingLive ? "live typing" : "paste at end")\(anchor == nil ? "" : ", anchored")")
 
-        if Setting.liveTyping && !focusAllows {
+        // Live typing going quiet with no explanation is exactly the failure
+        // mode this app logs against, so say which app turned it off and why.
+        if Setting.liveTyping && retypesByKeycode {
+            Diagnostic.log("type", "\(FocusProbe.frontmostApp) (\(bundle ?? "no bundle id")) re-encodes keystrokes by keycode — buffering this take and pasting at the end")
+            status = "\(FocusProbe.frontmostApp) needs pasted text — will paste at the end"
+        } else if Setting.liveTyping && !focusAllows {
             status = "\(FocusProbe.frontmostApp) has no text field — will paste at the end"
         }
 

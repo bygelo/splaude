@@ -78,4 +78,10 @@ enum FocusProbe {
     static var frontmostApp: String {
         NSWorkspace.shared.frontmostApplication?.localizedName ?? "unknown"
     }
+
+    /// The stable identity of the frontmost app, for decisions that must not be
+    /// made on a localised display name.
+    static var frontmostBundleIdentifier: String? {
+        NSWorkspace.shared.frontmostApplication?.bundleIdentifier
+    }
 }

@@ -26,6 +26,33 @@ pub struct Take {
     session: Session,
 }
 
+/// Where a take tells the interface what it is doing.
+///
+/// Both callbacks fire on threads the take owns — the level on the audio
+/// callback, the transcript on the socket task — so neither may touch the tray,
+/// which belongs to the main thread. They exist to hand a value to whoever can.
+pub struct Report {
+    /// Smoothed 0…1 input level, once per audio buffer. Hundreds of times a
+    /// second: whatever this does has to be cheap or has to filter.
+    pub level: Box<dyn Fn(f32) + Send + 'static>,
+    /// The take's committed text, once, when the socket closes. Never called
+    /// with an empty string — a take that produced nothing has nothing to say.
+    pub transcript: Box<dyn Fn(String) + Send + 'static>,
+}
+
+// Only the Linux build, which has no tray, has nobody to report to; everywhere
+// else a take always has a real destination, so this would be dead code.
+#[cfg(target_os = "linux")]
+impl Report {
+    /// Nobody is listening.
+    pub fn silent() -> Self {
+        Self {
+            level: Box::new(|_level| {}),
+            transcript: Box::new(|_text| {}),
+        }
+    }
+}
+
 impl Take {
     /// Opens the socket and the microphone. Returns once both are live, so a
     /// failure here means nothing was started rather than half of it.
@@ -34,6 +61,7 @@ impl Take {
         store: Arc<Store>,
         setting: &Setting,
         injector: Sender<Command>,
+        report: Report,
     ) -> Result<Self> {
         let credential = store.load().context("no usable Claude Code credential")?;
 
@@ -53,13 +81,20 @@ impl Take {
                 .context("could not open the speech socket")?
         };
 
-        runtime.spawn(consume(inbox, injector, setting.clone(), anchor));
+        let Report { level, transcript } = report;
+        runtime.spawn(consume(
+            inbox,
+            injector,
+            setting.clone(),
+            anchor,
+            transcript,
+        ));
 
         let feeding = session.clone();
         let capture = Capture::start(
             backend.audio_format(),
             Box::new(move |pcm| feeding.send_audio(pcm)),
-            Box::new(|_level| {}),
+            level,
         )
         .context("could not open the microphone")?;
 
@@ -84,6 +119,7 @@ async fn consume(
     injector: Sender<Command>,
     setting: Setting,
     anchor: Option<String>,
+    on_transcript: Box<dyn Fn(String) + Send + 'static>,
 ) {
     let mut buffer = TranscriptBuffer::new();
     let mut typer = Typer::new();
@@ -117,17 +153,23 @@ async fn consume(
         }
     }
 
+    let committed = buffer.committed().to_string();
+    if committed.is_empty() {
+        return;
+    }
+
     // Buffered mode types nothing until the end, so the whole take lands here.
     // Live typing has already emitted it.
-    if !setting.live_typing {
-        let committed = buffer.committed().to_string();
-        if !committed.is_empty() && may_type(&setting, anchor.as_deref()) {
-            let _ = injector.send(Command::Type {
-                text: committed,
-                interval_micros: setting.typing_interval,
-            });
-        }
+    if !setting.live_typing && may_type(&setting, anchor.as_deref()) {
+        let _ = injector.send(Command::Type {
+            text: committed.clone(),
+            interval_micros: setting.typing_interval,
+        });
     }
+
+    // Reported whether or not it was typed. Text the focus guard refused is
+    // exactly the text a user most wants a copy of.
+    on_transcript(committed);
 }
 
 fn emit(injector: &Sender<Command>, action: splaude_core::TypeAction, interval_micros: u32) {

@@ -116,11 +116,47 @@ pub struct Hotkey {
 }
 
 impl Default for Hotkey {
-    /// Alt+Space — the same physical chord as the Swift build's Option+Space.
+    /// The platforms want different shapes here, and the reason is not taste.
+    ///
+    /// A modified binding needs the modifier held down for the OS to keep
+    /// matching the registered chord. macOS obliges: synthetic events are built
+    /// from a private event source and stamped with flags the injector tracks
+    /// itself, so the physical modifier is never touched and `⌥/` survives a
+    /// whole take. Windows has no per-event modifier mask — the only thing
+    /// expressible is a real key-up — which forces a choice, and both options
+    /// were tried against a live take and observed failing:
+    ///
+    /// - **Release it** and the OS stops matching the chord, so the still-held
+    ///   key falls through to the focused window and auto-repeats. A dictation
+    ///   on `Alt+Space` came back shot through with spaces, mid-word.
+    /// - **Hold it** and every synthetic keystroke inherits it. `Alt+Backspace`
+    ///   is undo in a great many applications, and the live-typing diff corrects
+    ///   itself with backspaces — so each revision wiped the sentence before it.
+    ///
+    /// There is no third option, and no safe modifier: `Ctrl+Backspace` deletes
+    /// a word, `Shift` uppercases everything, `Win` turns each keystroke into a
+    /// shortcut. A binding with **no modifier at all** has nothing to release
+    /// and nothing to inherit, which is why Windows defaults to a bare function
+    /// key. `is_safe` already permits those precisely because the Swift build
+    /// went out of its way to allow a bare function key.
     fn default() -> Self {
-        Self {
-            modifier: Modifiers::ALT,
-            code: Code::Space,
+        #[cfg(target_os = "windows")]
+        {
+            Self {
+                modifier: Modifiers::empty(),
+                code: Code::F9,
+            }
+        }
+
+        // macOS keeps the chord the shipping Swift build uses, and Linux has
+        // the same per-event problem as Windows in principle — but X11 is
+        // untested here, so it is not given a different default on a guess.
+        #[cfg(not(target_os = "windows"))]
+        {
+            Self {
+                modifier: Modifiers::ALT,
+                code: Code::Slash,
+            }
         }
     }
 }
@@ -432,14 +468,30 @@ impl Setting {
 mod test {
     use super::*;
 
+    /// The default differs by platform on purpose — see `Hotkey::default`. The
+    /// property that matters on Windows is not *which* key it is but that it
+    /// carries **no modifier**, since a modified binding cannot be delivered
+    /// safely there: releasing the modifier leaks the bound key into the take,
+    /// and holding it turns every corrective backspace into undo.
     #[test]
-    fn default_binding_is_alt_space() {
-        assert_eq!(Hotkey::default().to_string(), "Alt+Space");
+    fn the_default_binding_suits_its_platform() {
+        let default = Hotkey::default();
+        assert!(default.is_safe(), "a default that is_safe rejects is a bug");
+
+        if cfg!(target_os = "windows") {
+            assert!(
+                default.modifier.is_empty(),
+                "a modified default is unusable on Windows, got {default}"
+            );
+        } else {
+            assert_eq!(default.to_string(), "Alt+Slash");
+        }
     }
 
     #[test]
     fn round_trips_a_binding_through_text() {
         for text in [
+            "Alt+Slash",
             "Alt+Space",
             "Ctrl+Shift+KeyD",
             "F13",
@@ -453,8 +505,8 @@ mod test {
     #[test]
     fn accepts_the_platform_spellings_people_type() {
         assert_eq!(
-            "Option+Space".parse::<Hotkey>().unwrap(),
-            Hotkey::default(),
+            "Option+Slash".parse::<Hotkey>().unwrap(),
+            "Alt+Slash".parse::<Hotkey>().unwrap(),
             "Option is what a mac user calls Alt"
         );
         assert_eq!(

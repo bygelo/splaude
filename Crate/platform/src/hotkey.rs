@@ -265,11 +265,21 @@ mod test {
         to_registrable(text.parse::<splaude_core::Hotkey>().unwrap()).unwrap()
     }
 
+    /// The default differs by platform — `splaude_core::Hotkey::default` says
+    /// why — so this pins that whatever it is, it survives the crossing to the
+    /// vocabulary `global-hotkey` registers with. An unmappable default would
+    /// mean an app that cannot bind its own hotkey on first run.
     #[test]
     fn maps_the_default_binding() {
-        let key = to_registrable(splaude_core::Hotkey::default()).unwrap();
-        assert_eq!(key.mods, Modifiers::ALT);
-        assert_eq!(key.key, Code::Space);
+        let binding = splaude_core::Hotkey::default();
+        let key = to_registrable(binding).unwrap();
+        assert_eq!(key.key.to_string(), binding.code.to_string());
+
+        if cfg!(target_os = "windows") {
+            assert_eq!(key.mods, Modifiers::empty());
+        } else {
+            assert_eq!(key.mods, Modifiers::ALT);
+        }
     }
 
     #[test]

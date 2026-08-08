@@ -15,6 +15,18 @@
 //! so a naive injector deletes the user's sentence one word per keystroke. See
 //! `neutralize_modifier` for how each platform is defused.
 //!
+//! **The defence's own wound: the binding's modifier.** Releasing a modifier on
+//! Windows is not a local act. `RegisterHotKey` decides whether a physical
+//! keypress is the registered chord — and therefore whether the focused window
+//! ever sees it — by reading that same global modifier state. Assert a key-up
+//! for `Alt` while the user holds `Alt+Space` and the chord stops matching, so
+//! their still-held `Space` stops being swallowed and auto-repeats into the
+//! focused window as ordinary spaces, interleaved with the take. That is what
+//! [`Injector::set_binding`] is for: the modifier that is part of the *live*
+//! binding is left alone, every other one is still cleared, because a stray
+//! held `Ctrl` is the original hazard and has not gone away. macOS needs none
+//! of this — the private event source means no modifier is ever touched.
+//!
 //! **The layout defence is also the remote-desktop wound.** `Keyboard::text`
 //! puts the codepoint in the payload and leaves the keycode at 0. A native app
 //! reads the payload; a remote-desktop or VM client re-encodes keyboard input
@@ -80,6 +92,14 @@ const CLIPBOARD_SETTLE_MILLIS: u64 = 350;
 
 pub struct Injector {
     enigo: Enigo,
+
+    /// The modifier `neutralize_modifier` must leave alone, because the live
+    /// push-to-talk binding is made of it. Empty until [`Injector::set_binding`]
+    /// says otherwise, which is the safe default: an empty exclusion is exactly
+    /// the unconditional clearing this module did before, so a caller that never
+    /// sets a binding gets the old behaviour rather than a stuck modifier.
+    #[cfg(not(target_os = "macos"))]
+    binding_modifier: Vec<Key>,
 }
 
 impl Injector {
@@ -97,8 +117,33 @@ impl Injector {
 
         let enigo = Enigo::new(&setting).context("could not open a synthetic input connection")?;
 
-        Ok(Self { enigo })
+        Ok(Self {
+            enigo,
+            #[cfg(not(target_os = "macos"))]
+            binding_modifier: Vec::new(),
+        })
     }
+
+    /// Tells the injector which chord push-to-talk is currently bound to.
+    ///
+    /// A setter rather than a constructor argument because the binding is not a
+    /// fact about the injector's lifetime: [`crate::HotkeyListener::rebind`] can
+    /// move it while the process runs, and an injector built once at startup
+    /// would otherwise go on protecting a chord the user has abandoned — sparing
+    /// a modifier nobody is holding, and clearing the one they now are. Whoever
+    /// owns the listener owns this call, and must repeat it after every
+    /// successful rebind.
+    ///
+    /// A no-op on macOS: nothing is released there, so there is nothing to
+    /// exclude.
+    #[cfg(not(target_os = "macos"))]
+    pub fn set_binding(&mut self, binding: splaude_core::Hotkey) {
+        self.binding_modifier = binding_modifier(binding);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[allow(clippy::unused_self)]
+    pub fn set_binding(&mut self, _binding: splaude_core::Hotkey) {}
 
     pub fn type_text(&mut self, text: &str, interval_micros: u32) -> Result<()> {
         // Text arrives from a speech model, so a NUL is implausible, but enigo
@@ -271,9 +316,22 @@ impl Injector {
     /// push-to-talk chord end early, and on Windows a lone Alt key-up can
     /// activate an app's menu bar. Both are strictly better than silently
     /// deleting the user's words a word at a time.
+    ///
+    /// The binding's own modifier is skipped; the module header says why. The
+    /// cost of skipping it is real and worth naming: with `Alt` still down, an
+    /// app that treats `Alt+Backspace` as undo will do that instead of deleting
+    /// a character, and Windows may route our synthetic text as `WM_SYSCHAR`.
+    /// The alternative is the leak, which corrupts every take on a printable
+    /// binding rather than misbehaving in some apps, so this is the side to err
+    /// on — but a binding whose modifier is `Alt` is the least comfortable
+    /// shape, and a bare function key needs no exclusion at all.
     #[cfg(not(target_os = "macos"))]
     fn neutralize_modifier(&mut self) -> Result<()> {
         for key in MODIFIER {
+            if self.binding_modifier.contains(&key) {
+                continue;
+            }
+
             self.enigo
                 .key(key, Direction::Release)
                 .context("could not clear a held modifier before typing")?;
@@ -281,6 +339,42 @@ impl Injector {
 
         Ok(())
     }
+}
+
+/// The modifier keys a binding is made of, as the keys the injector would
+/// otherwise release.
+///
+/// Pure, and deliberately so: it is the whole correctness argument of the
+/// exclusion, and testing it must not require a window server or a held key.
+///
+/// Only the modifier crosses over, never `binding.code`. A synthetic key-up for
+/// the binding's *key* would not stop the leak it looks like it addresses —
+/// auto-repeat is driven by the physical key being down, and the driver keeps
+/// posting fresh key-downs regardless of what key-ups we inject in between, so
+/// it would suppress nothing. It would also be actively harmful: a key-up for
+/// the bound key is indistinguishable from the user letting go of push-to-talk,
+/// which is how a take ends. The exclusion above is what stops the leak; there
+/// is nothing left for the key itself to do.
+///
+/// The output is empty for an unmodified binding — a bare `F13` — which is the
+/// correct answer twice over. Nothing we release is holding `F13` down, so it
+/// cannot leak in the first place, and clearing all four modifiers is exactly
+/// the behaviour that has always been right when no modifier belongs to the
+/// chord.
+#[cfg(not(target_os = "macos"))]
+fn binding_modifier(binding: splaude_core::Hotkey) -> Vec<Key> {
+    // `Key::Meta` is enigo's name for the key `splaude_core` calls META and
+    // Windows calls Win — same physical key, three vocabularies.
+    [
+        (splaude_core::Modifiers::CONTROL, Key::Control),
+        (splaude_core::Modifiers::ALT, Key::Alt),
+        (splaude_core::Modifiers::SHIFT, Key::Shift),
+        (splaude_core::Modifiers::META, Key::Meta),
+    ]
+    .into_iter()
+    .filter(|(flag, _)| binding.modifier.contains(*flag))
+    .map(|(_, key)| key)
+    .collect()
 }
 
 fn sleep_micros(micros: u32) {
@@ -318,6 +412,80 @@ fn chunk_char(text: &str, len: usize) -> Vec<&str> {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    /// Nothing here presses a key. The exclusion is a pure mapping precisely so
+    /// it can be checked without a window server or a physically held chord.
+    #[cfg(not(target_os = "macos"))]
+    mod exclusion {
+        use super::*;
+
+        fn spared(text: &str) -> Vec<Key> {
+            binding_modifier(text.parse::<splaude_core::Hotkey>().unwrap())
+        }
+
+        #[test]
+        fn each_modifier_maps_to_its_enigo_key() {
+            assert_eq!(spared("Ctrl+KeyD"), vec![Key::Control]);
+            assert_eq!(spared("Alt+KeyD"), vec![Key::Alt]);
+            assert_eq!(spared("Shift+KeyD"), vec![Key::Shift]);
+            assert_eq!(spared("Meta+KeyD"), vec![Key::Meta]);
+        }
+
+        /// On Windows the default is a bare function key, and sparing *nothing*
+        /// is the whole point: with no modifier to hold there is none to inherit
+        /// into a backspace, and none to release that was suppressing the bound
+        /// key. Elsewhere the default is `Alt+Slash`, where Alt must survive the
+        /// clearing or the chord stops matching and the held Slash leaks into
+        /// the take. Both directions are the same rule seen from two platforms.
+        #[test]
+        fn the_default_binding_spares_only_what_it_holds() {
+            let spared = binding_modifier(splaude_core::Hotkey::default());
+
+            if cfg!(target_os = "windows") {
+                assert!(
+                    spared.is_empty(),
+                    "the Windows default must carry no modifier, spared {spared:?}"
+                );
+            } else {
+                assert_eq!(spared, vec![Key::Alt]);
+            }
+        }
+
+        #[test]
+        fn a_printable_key_contributes_nothing_of_its_own() {
+            // Only the modifier crosses over. Slash and Space are both printable
+            // and both bound to Alt, so they must map identically — the key
+            // itself is never released.
+            assert_eq!(spared("Alt+Slash"), spared("Alt+Space"));
+            assert_eq!(spared("Alt+Slash"), vec![Key::Alt]);
+        }
+
+        #[test]
+        fn a_bare_function_key_spares_nothing() {
+            // Nothing we release is holding F13 down, so every modifier is
+            // still cleared — the pre-existing behaviour, unchanged.
+            assert!(spared("F13").is_empty());
+        }
+
+        #[test]
+        fn a_multi_modifier_binding_spares_all_of_them() {
+            let spared = spared("Ctrl+Alt+Shift+Meta+KeyA");
+            for key in MODIFIER {
+                assert!(spared.contains(&key), "{key:?} should be spared");
+            }
+        }
+
+        /// Whatever is spared has to be drawn from the set the injector would
+        /// otherwise release, or the exclusion cannot exclude anything.
+        #[test]
+        fn every_spared_key_is_one_the_injector_releases() {
+            for text in ["Ctrl+KeyD", "Alt+Slash", "Shift+F5", "Meta+KeyD", "F13"] {
+                for key in spared(text) {
+                    assert!(MODIFIER.contains(&key), "{key:?} from {text}");
+                }
+            }
+        }
+    }
 
     #[test]
     fn empty_text_yields_no_chunk() {

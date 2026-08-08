@@ -34,11 +34,20 @@ pub enum Command {
 }
 
 /// Starts the injector thread. Dropping the returned sender ends it.
-pub fn spawn() -> Result<Sender<Command>> {
+///
+/// `binding` is the push-to-talk chord the hotkey listener is about to register.
+/// The injector needs it to know which held modifier it must *not* release —
+/// see `splaude_platform`'s injector for why releasing that one leaks the user's
+/// held key into the take. It is passed here rather than sent as a command
+/// because the thread below owns the injector from the moment it starts, and
+/// nothing in this build rebinds at runtime; when something does, the rebind
+/// must reach the injector too, which means a command for it.
+pub fn spawn(binding: splaude_core::Hotkey) -> Result<Sender<Command>> {
     // Built here rather than on the thread so a missing permission (macOS
     // Accessibility, a Wayland session) surfaces as a startup error the user can
     // read, instead of a thread that silently does nothing.
     let mut injector = Injector::new().context("could not open synthetic input")?;
+    injector.set_binding(binding);
 
     let (command, inbox) = mpsc::channel::<Command>();
 

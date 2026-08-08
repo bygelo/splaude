@@ -12,9 +12,9 @@
 //! It is an undocumented internal endpoint authenticated with the Claude Code
 //! OAuth token. It can change or disappear without notice.
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
@@ -32,6 +32,24 @@ const ENDPOINT: &str = "wss://api.anthropic.com/api/ws/speech_to_text/voice_stre
 const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(8);
 const CLOSE_GRACE: Duration = Duration::from_secs(3);
 const KEYTERM_BYTE_BUDGET: usize = 1024;
+
+/// How far ahead of the clock the writer is allowed to run — the amount of
+/// not-yet-spoken audio the server may be holding at any moment.
+///
+/// Zero would be the purest reading of "pace it like a microphone", but it
+/// costs a timer wakeup per 32 ms buffer, and a Windows timer that rounds up by
+/// its own granularity would stretch the flush well past the take. A quarter
+/// second is coarse enough that a 2 s backlog costs a handful of sleeps, and
+/// short enough to stay inside `endpointing_ms=300` — the server never carries
+/// enough unheard audio to change where it decides an utterance ended.
+const PACE_LEAD: Duration = Duration::from_millis(250);
+
+/// Ceiling on the total delay pacing and the close hold may add to one take.
+/// Not a tuning knob — a stop. The delay is bounded by the take's own length
+/// already, so reaching this means the socket took most of a dictation to come
+/// up, and a user staring at a finished take is served worse by waiting longer
+/// than by an imperfect transcript.
+const LAG_CAP: Duration = Duration::from_secs(10);
 
 const KEEP_ALIVE_FRAME: &str = r#"{"type":"KeepAlive"}"#;
 const CLOSE_FRAME: &str = r#"{"type":"CloseStream"}"#;
@@ -139,6 +157,78 @@ impl SpeechBackend for AnthropicSpeechBackend {
     }
 }
 
+// MARK: - Backlog
+
+/// How far ahead of real time the audio written to the socket has run.
+///
+/// The recogniser on the other end is a *streaming* one — `endpointing_ms` and
+/// `utterance_end_ms` are windows over a live stream, and `CloseStream` makes it
+/// finalise on whatever it has decoded so far. The handshake to
+/// `api.anthropic.com` takes a second or more, and audio captured before the
+/// socket is up queues locally, so it would leave in one burst the instant the
+/// connection opens. On a long take that burst is followed by seconds of live
+/// speech and nobody notices. On a take shorter than the handshake the whole
+/// dictation goes out in milliseconds with `CloseStream` right behind it, and
+/// the server commits a fragment of a sentence.
+///
+/// Holding `CloseStream` for the length of the burst was the first attempt at
+/// that, and it did not work: the server appears to decode at roughly real time
+/// *over stream time*, so seconds of audio handed over in one write buy it no
+/// time to decode them, and idle wall clock afterwards is not a substitute for
+/// audio that arrives while it is listening. So the debt this tracks is now
+/// spent where it does work — throttling the writer, so the flush looks like a
+/// microphone instead of a file copy — and only the remainder is spent holding
+/// the close.
+///
+/// Debt is the audio that arrived faster than it could have been spoken and has
+/// not yet been paid back in wall clock. It drains with the clock, and audio
+/// arriving no faster than real time adds nothing to it: a live feed asks the
+/// server for no time it is not already being given. That asymmetry is the whole
+/// point — it is what leaves a take that never fell behind untouched by any of
+/// this, paced not at all and held not at all.
+#[derive(Debug)]
+struct Backlog {
+    format: SpeechAudioFormat,
+    /// When the last chunk went out, so the clock since then can pay the debt
+    /// down. `None` until the first write, when there is nothing to measure
+    /// against and nothing owed.
+    last_write: Option<Instant>,
+    owed: Duration,
+}
+
+impl Backlog {
+    fn new(format: SpeechAudioFormat) -> Self {
+        Self {
+            format,
+            last_write: None,
+            owed: Duration::ZERO,
+        }
+    }
+
+    /// Records a chunk of `byte_count` bytes handed to the socket at `at`.
+    fn wrote(&mut self, byte_count: usize, at: Instant) {
+        let spoken = self.format.duration_of(byte_count);
+        let gap = self
+            .last_write
+            .map(|last| at.saturating_duration_since(last))
+            .unwrap_or_default();
+
+        // Wall clock since the previous chunk pays the debt down…
+        self.owed = self.owed.saturating_sub(gap);
+        // …and only the part of this chunk that outran the clock adds to it.
+        self.owed += spoken.saturating_sub(gap);
+        self.last_write = Some(at);
+    }
+
+    /// What the server is still owed as of `at`.
+    fn owed(&self, at: Instant) -> Duration {
+        match self.last_write {
+            Some(last) => self.owed.saturating_sub(at.saturating_duration_since(last)),
+            None => Duration::ZERO,
+        }
+    }
+}
+
 /// Owns the socket for the life of one take.
 async fn run(
     request: http::Request<()>,
@@ -184,31 +274,96 @@ async fn run(
     let grace = tokio::time::sleep(CLOSE_GRACE);
     tokio::pin!(grace);
 
+    // Armed when the writer has run `PACE_LEAD` ahead of the clock, and again
+    // when the take ends owing the remainder. Both are timers rather than
+    // in-line sleeps so the read branch keeps running: interims arrive and live
+    // typing carries on right through a paced flush.
+    let pace = tokio::time::sleep(Duration::ZERO);
+    tokio::pin!(pace);
+    let hold = tokio::time::sleep(Duration::ZERO);
+    tokio::pin!(hold);
+
     // Set once CloseStream is sent. The server then drops the connection, and
     // the still-running receive loop sees that as an error — an expected one,
     // which must not be reported or it buries the real status message.
     let mut is_finishing = false;
+    // Set when the take ends. No further frame can arrive after it, so the
+    // frame branch must stand down or a closed channel spins the loop.
+    let mut is_ended = false;
+    // Each guards its timer against being polled once already elapsed.
+    let mut is_pacing = false;
+    let mut is_holding = false;
+
+    // Audio waiting for the clock to let it out. The capture side is unbounded
+    // and never blocks, so a slow flush backs up here rather than in the mixer.
+    let mut outbound: VecDeque<Vec<u8>> = VecDeque::new();
+    let mut backlog = Backlog::new(SpeechAudioFormat::LINEAR16_16K);
+    let mut lag = Duration::ZERO;
     let mut pending = String::new();
 
     loop {
+        // Meter the queue out at roughly the rate it was recorded. Whatever the
+        // clock already covers goes immediately — which for a live microphone is
+        // every buffer, the instant it arrives, exactly as before pacing
+        // existed. Only audio that has outrun the clock waits, and it waits here
+        // rather than at the close, so the server is decoding during the delay
+        // instead of being handed a block and a stopwatch.
+        while !is_pacing && !outbound.is_empty() {
+            let owed = backlog.owed(Instant::now());
+            if owed >= PACE_LEAD && lag < LAG_CAP {
+                let wait = owed.min(LAG_CAP - lag);
+                if lag.is_zero() {
+                    diagnostic::log(
+                        "socket",
+                        format!(
+                            "audio outran real time by {} ms — pacing the flush",
+                            owed.as_millis()
+                        ),
+                    );
+                }
+                lag += wait;
+                pace.as_mut().reset(tokio::time::Instant::now() + wait);
+                is_pacing = true;
+                break;
+            }
+
+            let pcm = outbound.pop_front().expect("queue is not empty");
+            let byte_count = pcm.len();
+            if let Err(error) = write.send(Message::binary(pcm)).await {
+                emit(SpeechEvent::Fail {
+                    message: format!("audio send failed: {error}"),
+                    fatal: false,
+                });
+            } else {
+                backlog.wrote(byte_count, Instant::now());
+            }
+        }
+
+        // The close is the last thing in the same queue. CloseStream finalises
+        // the utterance, so sending it while the server is still a beat behind
+        // commits a fragment; pacing leaves at most `PACE_LEAD` of that beat
+        // outstanding, and this hands it back. A take that kept pace owes
+        // nothing and closes as it always did — the timer fires on the next turn
+        // of the loop.
+        if is_ended && outbound.is_empty() && !is_pacing && !is_holding && !is_finishing {
+            let owed = backlog
+                .owed(Instant::now())
+                .min(LAG_CAP.saturating_sub(lag));
+            if !owed.is_zero() {
+                diagnostic::log(
+                    "socket",
+                    format!("holding CloseStream {} ms", owed.as_millis()),
+                );
+            }
+            hold.as_mut().reset(tokio::time::Instant::now() + owed);
+            is_holding = true;
+        }
+
         tokio::select! {
-            incoming = frame.recv(), if !is_finishing => match incoming {
-                Some(Frame::Audio(pcm)) => {
-                    if let Err(error) = write.send(Message::binary(pcm)).await {
-                        emit(SpeechEvent::Fail {
-                            message: format!("audio send failed: {error}"),
-                            fatal: false,
-                        });
-                    }
-                }
+            incoming = frame.recv(), if !is_ended => match incoming {
+                Some(Frame::Audio(pcm)) => outbound.push_back(pcm),
                 // An explicit finish and a dropped Session mean the same thing.
-                Some(Frame::Close) | None => {
-                    is_finishing = true;
-                    diagnostic::log("socket", "closing");
-                    let _ = write.send(Message::text(CLOSE_FRAME)).await;
-                    // Give the server a moment to flush a trailing endpoint event.
-                    grace.as_mut().reset(tokio::time::Instant::now() + CLOSE_GRACE);
-                }
+                Some(Frame::Close) | None => is_ended = true,
             },
 
             message = read.next() => match message {
@@ -232,6 +387,17 @@ async fn run(
                 }
                 None => break,
             },
+
+            _ = &mut pace, if is_pacing => is_pacing = false,
+
+            _ = &mut hold, if is_holding => {
+                is_holding = false;
+                is_finishing = true;
+                diagnostic::log("socket", "closing");
+                let _ = write.send(Message::text(CLOSE_FRAME)).await;
+                // Give the server a moment to flush a trailing endpoint event.
+                grace.as_mut().reset(tokio::time::Instant::now() + CLOSE_GRACE);
+            }
 
             _ = keep_alive.tick(), if !is_finishing => {
                 let _ = write.send(Message::text(KEEP_ALIVE_FRAME)).await;
@@ -510,6 +676,88 @@ mod test {
             &setting,
         );
         assert!(backend.url().contains("language=en-GB"));
+    }
+
+    // MARK: - Backlog
+
+    /// One capture buffer: 32 ms at 16 kHz mono int16.
+    const CHUNK_BYTE: usize = 1_024;
+    const CHUNK_SPAN: Duration = Duration::from_millis(32);
+
+    fn close_to(left: Duration, right: Duration) -> bool {
+        left.max(right) - left.min(right) < Duration::from_millis(5)
+    }
+
+    #[test]
+    fn audio_arriving_at_the_pace_it_was_spoken_owes_nothing() {
+        let mut backlog = Backlog::new(SpeechAudioFormat::LINEAR16_16K);
+        let base = Instant::now();
+        for index in 0..50_u32 {
+            backlog.wrote(CHUNK_BYTE, base + CHUNK_SPAN * index);
+        }
+        // The first chunk is the only one that ever outran the clock, and the
+        // second chunk's gap paid it back.
+        assert_eq!(backlog.owed(base + CHUNK_SPAN * 50), Duration::ZERO);
+    }
+
+    #[test]
+    fn a_burst_owes_the_time_it_saved() {
+        let mut backlog = Backlog::new(SpeechAudioFormat::LINEAR16_16K);
+        let base = Instant::now();
+        // A whole 3.2 s take, queued during the handshake and flushed in 16 ms.
+        for index in 0..100_u32 {
+            backlog.wrote(CHUNK_BYTE, base + Duration::from_micros(160) * index);
+        }
+        // Owed: the whole take, less the handful of milliseconds the flush
+        // itself took. Nothing else paid any of it back.
+        let owed = backlog.owed(base + Duration::from_millis(16));
+        assert!(
+            owed > Duration::from_millis(3_100) && owed <= Duration::from_millis(3_200),
+            "expected roughly the take's own length, got {owed:?}"
+        );
+    }
+
+    #[test]
+    fn what_is_owed_drains_with_the_clock() {
+        let mut backlog = Backlog::new(SpeechAudioFormat::LINEAR16_16K);
+        let base = Instant::now();
+        backlog.wrote(CHUNK_BYTE * 10, base);
+        assert!(close_to(backlog.owed(base), Duration::from_millis(320)));
+        assert!(close_to(
+            backlog.owed(base + Duration::from_millis(200)),
+            Duration::from_millis(120)
+        ));
+        assert_eq!(backlog.owed(base + Duration::from_secs(1)), Duration::ZERO);
+    }
+
+    /// The regression that matters for the normal case: a long take opens with
+    /// the same burst a short one does, but the speech that follows it arrives
+    /// live, and by the time the user stops talking the debt is long gone.
+    #[test]
+    fn a_long_take_owes_nothing_by_the_time_the_speaker_stops() {
+        let mut backlog = Backlog::new(SpeechAudioFormat::LINEAR16_16K);
+        let base = Instant::now();
+
+        // 1.3 s of audio queued behind the handshake, flushed in 10 ms.
+        let burst_count = 1_300 / 32;
+        for index in 0..burst_count {
+            backlog.wrote(CHUNK_BYTE, base + Duration::from_micros(250) * index);
+        }
+        assert!(backlog.owed(base + Duration::from_millis(10)) > Duration::from_secs(1));
+
+        // Then twenty more seconds of speech, arriving as it is spoken.
+        let mut at = base + Duration::from_millis(10);
+        for _ in 0..(20_000 / 32) {
+            at += CHUNK_SPAN;
+            backlog.wrote(CHUNK_BYTE, at);
+        }
+        assert_eq!(backlog.owed(at), Duration::ZERO);
+    }
+
+    #[test]
+    fn a_take_with_no_audio_at_all_owes_nothing() {
+        let backlog = Backlog::new(SpeechAudioFormat::LINEAR16_16K);
+        assert_eq!(backlog.owed(Instant::now()), Duration::ZERO);
     }
 
     #[test]

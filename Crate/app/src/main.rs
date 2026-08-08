@@ -179,6 +179,13 @@ impl Running {
         // Before the take, not after: `Take::finish` waits on the microphone
         // and the socket, and the hook must not outlive the take it belongs to
         // by however long that costs.
+        //
+        // Off Windows there is no hook, so `submit::Watch` is an uninhabited
+        // enum, `Option<Watch>` is statically `None`, and clippy is right that
+        // dropping it does nothing. Kept anyway: the ordering is the point, and
+        // writing it only where it currently bites would leave the next
+        // platform to grow a watcher with a silent use-after-take.
+        #[allow(clippy::drop_non_drop)]
         drop(submit);
         take.finish();
     }

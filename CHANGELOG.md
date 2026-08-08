@@ -6,6 +6,27 @@ Notable changes to splaude. Format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- The test suite no longer writes into the real log. Opening the log file used
+  to be automatic, so anything that linked `splaude-core` and logged a line
+  appended to `splaude.log` — including every test, run in parallel by cargo,
+  which interleaved fragments of unrelated runs into the one file *Reveal Log*
+  exists to show when dictation misbehaves. The file is now something a program
+  asks for with `diagnostic::to_file`, which only the dictation loop does; a
+  test cannot pollute it by forgetting to opt out. `--check` no longer creates a
+  log file either — a report that silently writes somewhere is a report that
+  surprises whoever ran it.
+- Log lines can no longer interleave. The file handle is held across the write
+  rather than reopened per line, so two threads cannot split each other's
+  sentences.
+- A startup that fails now says so in the log. The error was returned to the
+  runtime, which prints it to stderr — and a tray app launched from Explorer, a
+  shortcut or launch-at-login has no stderr anyone will read. What that looked
+  like from outside was the whole failure mode this log exists to prevent: no
+  icon, a hotkey that does nothing, and a log holding a `start` line with
+  nothing after it. Found in a real log, not in the suite.
+
 ### Added
 
 - splaude says when a newer version has been published. It asks GitHub once at
@@ -16,6 +37,9 @@ Notable changes to splaude. Format follows
 - An available update is promoted to the top of the menu, beside the credential
   warning, and only when there is one. "You are up to date" is an answer to a
   question, not news, so it stays in the diagnostics group below.
+- `SPLAUDE_LOG` overrides where the log is written — a full file path, for a
+  portable install that wants its log beside the binary, or a machine where the
+  usual location is not writable.
 
 It checks and reports; it does not download, replace or restart anything. That
 is a stopping point rather than an unfinished feature, and macOS is the reason:

@@ -198,7 +198,14 @@ fn main() -> Result<()> {
     let argument: Vec<String> = std::env::args().skip(1).collect();
 
     match argument.first().map(String::as_str) {
-        None => run(),
+        // Not `run()` alone: a failure out of here is returned to the runtime,
+        // which prints it to stderr and exits — and a tray app started from
+        // Explorer, a shortcut or launch-at-login has no stderr anyone will
+        // ever read. The whole reason this module exists is that every failure
+        // looks identical from outside ("nothing happened"), and a startup that
+        // dies is the loudest case of it: the icon never appears, the hotkey
+        // does nothing, and the log holds a `start` line with nothing after it.
+        None => run().inspect_err(|error| diagnostic::log("start", format!("{error:#}"))),
         Some("--check") => check(),
         Some("--help" | "-h") => {
             print!("{USAGE}");
@@ -227,6 +234,12 @@ fn main() -> Result<()> {
 ///
 /// It diverges: `EventLoop::run` never returns.
 fn run() -> Result<()> {
+    // The one place that opens the log file, and the first thing done here so
+    // nothing this run does is missing from it. Deliberately not in `main`:
+    // `--check`, `--version` and `--help` print their answer and leave, and a
+    // report that silently creates a file somewhere is a report that surprises
+    // whoever ran it — on a CI runner most of all.
+    diagnostic::to_file();
     diagnostic::session("start");
 
     // `mut` only on the platforms that have a tray: the launch-at-login item

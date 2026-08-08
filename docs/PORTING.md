@@ -120,15 +120,23 @@ model, not a port of this one. It is out of scope.
   push-to-talk hotkey on `global-hotkey`, reporting both edges; text injection
   on `enigo`; the focus guard; launch at login. Only the last two needed
   per-OS code.
-- `Crate/app` — a binary. `splaude` runs the dictation loop; `splaude --check`
-  reports credential, capability and settings state without opening anything,
-  so it is safe over SSH and in CI.
+- `Crate/app` (17 tests) — a binary on a `tao` main-thread event loop.
+  `splaude` runs the dictation loop and lives in the tray; `splaude --check`
+  reports credential, capability and settings state without opening a window, a
+  microphone or a loop, so it is safe over SSH and in CI.
+- The tray, on Windows and macOS: the app mark drawn in code, a face that
+  doubles as the input level meter, and a menu carrying credential health, the
+  last transcript (click to copy), Reveal Log, launch at login, and Quit. Quit
+  is the only orderly shutdown path — `Ctrl+C` never reaches `LoopDestroyed`,
+  so the hotkey stays registered with the OS and that chord is dead for every
+  other app until the session ends.
 
 ## Verified, and not
 
-`splaude --check` has been run on Windows and reads a real Claude Code
-credential out of `~/.claude/.credentials.json`. That is the one end-to-end
-path confirmed against a live machine.
+Confirmed against a live Windows machine: `splaude --check` reads a real Claude
+Code credential out of `~/.claude/.credentials.json`; the tray icon renders in
+the notification area; its tooltip and menu open and read correctly. CI compiles
+the whole workspace on Linux, macOS and Windows.
 
 **The dictation loop itself has never run.** No hotkey has been pressed, no
 socket opened against the real endpoint, no microphone captured — the
@@ -146,19 +154,32 @@ Two specifics that need that machine to settle:
   word at a time while push-to-talk is held. Consequences: a hotkey layer that
   detects release by polling key state may see the chord end early, and on
   Windows a lone Alt key-up can activate a menu bar.
-- **macOS cannot work as currently designed.** `global-hotkey` requires the
-  manager to be built on the main thread there, while Windows requires it to be
-  pinned to the thread that owns its hidden window — so the listener spawns its
-  own. Windows and X11 are unaffected; macOS needs main-thread construction
-  driven from the app crate before a Mac build is possible.
+- **The tray is seen, but not exercised.** The icon and menu render; nothing has
+  confirmed that the level meter moves, that the transcript item copies, that
+  Reveal Log lands on the right file, or that launch at login survives a
+  restart.
+
+The macOS hotkey blocker recorded here previously is **resolved**. It was never
+a platform problem: `global-hotkey` wants its manager on the main thread on
+macOS and pinned to the thread owning its hidden window on Windows, and the
+listener spawned its own thread only because the app had no event loop to
+borrow. Introducing one satisfies both, and CI now compiles the result on
+`macos-15`. Nobody has pressed the key on a Mac.
 
 ## Not done
 
-- The interface: tray icon, floating mic, settings window. The binary is a
-  console app that prints what it is doing.
+- The floating mic button and the settings window. Settings are the JSON file
+  at `Setting::path()`, which is deliberate — the Swift build made the same
+  trade with `defaults` — but a window would need a widget toolkit, and `tao`
+  supplies a window, not controls. That is the largest open dependency
+  question in the project.
+- Behaviour parity with the Mac app: tap-to-latch, Return ending a take, a
+  start/stop sound, and the Test Paste diagnostic.
+- No tray on Linux, deliberately. `tray-icon` there is a hard GTK3 and
+  libappindicator dependency that still renders nothing on a desktop with no
+  appindicator host, which stock GNOME is.
 - macOS secret-store credential source. The file fallback covers Windows and
   Linux completely and most macOS installs.
-- `Crate/app` has no tests.
 - Packaging for three platforms. CI checks all three, but the release workflow
   still builds and publishes the macOS Swift bundle only, on tag.
 - One inherited bug is carried deliberately rather than fixed under cover of a
@@ -169,8 +190,23 @@ Two specifics that need that machine to settle:
 Requires Rust 1.90 or newer. On Windows the MSVC linker comes from Visual
 Studio Build Tools; cargo finds it without a developer prompt.
 
+Linux needs headers the runner images do not ship: ALSA for `cpal`, libxdo for
+`enigo`, the X11 and xkb headers for the hotkey listener, and **GTK3 and D-Bus
+for `tao`**. That last pair is worth stating plainly, because it is the opposite
+of what the manifest implies — `tray-icon` is excluded on Linux specifically to
+keep GTK out, and then the event loop brings it anyway. The exclusion still
+avoids libappindicator, but the heavy dependency it was written to prevent
+arrives through `tao`. Whether Linux needs the event loop at all is open:
+`global-hotkey` spins its own thread on X11, so the pump is a Windows
+requirement and the main run loop a macOS one.
+
 ```sh
-cargo test --all        # 133 tests across the workspace
+sudo apt install pkg-config libasound2-dev libxdo-dev libxkbcommon-dev \
+  libx11-dev libgtk-3-dev libdbus-1-dev
+```
+
+```sh
+cargo test --all        # 151 tests across the workspace
 cargo clippy --all-targets --all-features -- -D warnings
 cargo fmt --all --check
 cargo run -p splaude-app -- --check    # credential and capability report

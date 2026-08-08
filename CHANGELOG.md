@@ -42,6 +42,21 @@ Notable changes to splaude. Format follows
   Windows, plus the Swift build, test, bundle and headless smoke check. Until
   now the only workflow ran on a tag, so nothing was verified until release.
   Green on all four legs on its first run.
+- A `tao` main-thread event loop in `Crate/app`, replacing the blocking channel
+  the app used to sit on. This is what unblocks macOS: `global-hotkey` wants
+  its manager on the main thread there and pinned to the thread owning its
+  hidden window on Windows, and the listener only spawned threads because there
+  was no loop to borrow. It now owns none.
+- A tray icon on Windows and macOS, drawn in code from the same proportions as
+  `Script/makeicon.swift` so both builds show the same mark. The face doubles
+  as the input level meter, filling bottom-up across five steps — a silent take
+  reads as recording first and quiet second, so a dead microphone is visible at
+  a glance rather than after a take that produced nothing.
+- Tray menu: credential health (rendered only when there is something to say),
+  the last transcript with click-to-copy, Reveal Log, launch at login, and
+  Quit — which is the only orderly shutdown path, and therefore the only one
+  that unregisters the hotkey. Every one of these was already implemented in
+  `core` or `platform` and had no caller; the work was wiring.
 
 ### Fixed
 
@@ -77,18 +92,19 @@ Notable changes to splaude. Format follows
   real machine; the run path is not. No hotkey has been pressed, no socket
   opened against the endpoint, no microphone captured — so the OS integration
   is verified by the compiler and by platform documentation, not by use.
-- On macOS the hotkey listener cannot work as designed: `global-hotkey` wants
-  its manager built on the main thread there, while Windows needs it pinned to
-  the thread owning its hidden window, so the listener spawns one. Windows and
-  X11 are unaffected. macOS runs the Swift app regardless.
 - The injector's held-modifier defence asserts a modifier key-up before every
   synthetic event on Windows and Linux, because neither exposes a per-event
   modifier mask. A hotkey layer that polls key state may therefore see the
   chord end early, and a lone Alt key-up can activate a Windows menu bar. Both
   beat deleting the user's words a word at a time; neither has been observed.
-- `Crate/app` has no tests.
-- No interface yet — tray icon, floating mic and settings window are unwritten,
-  so the binary is a console app. See [docs/PORTING.md](docs/PORTING.md).
+- The tray renders, but nothing beyond that is confirmed: not the level meter
+  moving, not the transcript item copying, not Reveal Log landing on the right
+  file, not launch at login surviving a restart.
+- `tao` puts GTK3 and D-Bus on Linux, which is the dependency `tray-icon` is
+  excluded there to avoid. Whether Linux needs the event loop at all is open —
+  `global-hotkey` spins its own thread on X11.
+- Still no floating mic and no settings window; settings are the JSON file. See
+  [docs/PORTING.md](docs/PORTING.md).
 
 ## [0.1.0] — 2026-07-31
 

@@ -4,7 +4,7 @@ Notable changes to splaude. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.2.0] — 2026-08-08
 
 ### Added
 
@@ -14,8 +14,9 @@ Notable changes to splaude. Format follows
   minutes of expiry and again once expired, rather than letting it surface as a
   dictation that mysteriously produces nothing.
 - Cross-platform Rust workspace under `Crate/`, targeting Windows, Linux and
-  macOS from one codebase. Not yet runnable — see [docs/PORTING.md](docs/PORTING.md)
-  for what is done and what is not. The shipping app is still the Swift build.
+  macOS from one codebase. Windows and Linux are downloads as of this release;
+  macOS still ships the Swift `.app`, and deliberately — see
+  [docs/PORTING.md](docs/PORTING.md) for why, and for what is still not done.
 - `Crate/core` — the portable half, ported from Swift with 60 tests: the
   Anthropic speech backend (endpoint, query parameters, headers, keyterm
   packing, keepalive and close framing all preserved verbatim), credential
@@ -41,7 +42,10 @@ Notable changes to splaude. Format follows
 - `Check` workflow running formatting, clippy and tests on Linux, macOS and
   Windows, plus the Swift build, test, bundle and headless smoke check. Until
   now the only workflow ran on a tag, so nothing was verified until release.
-  Green on all four legs on its first run.
+  Green on all four legs on its first run. It also runs `splaude --check` on
+  every platform: the suite links the crates and calls into them but never
+  executes the binary, so without this the first run on Linux would have
+  happened after a tag was pushed and every artifact was already built.
 - A `tao` main-thread event loop in `Crate/app`, replacing the blocking channel
   the app used to sit on. This is what unblocks macOS: `global-hotkey` wants
   its manager on the main thread there and pinned to the thread owning its
@@ -160,10 +164,16 @@ Notable changes to splaude. Format follows
   deliberately rather than changed under cover of a rewrite; the Rust test
   `a_longer_contradicting_target_may_only_append_past_the_lock` pins the
   current behaviour and names it as a divergence.
-- The Rust build has only ever run on Windows. Dictation there is confirmed
-  end to end — hotkey, microphone, socket, live typing into a real editor — and
-  every bug fixed above came from that use, not from the suite. Linux and macOS
-  compile in CI and have never been launched.
+- Dictation has only ever happened on Windows. It is confirmed end to end there
+  — hotkey, microphone, socket, live typing into a real editor — and every bug
+  fixed above came from that use, not from the suite. Linux and macOS now run
+  `splaude --check` in CI, so the binary is known to start, find its
+  configuration and exit cleanly on both; nobody has held the key on either.
+- `--check` reports `global hotkey yes` and `type into apps yes` on a machine
+  with no display at all. The probe only separates Wayland from not-Wayland, so
+  an unset `DISPLAY` reads as a working X11 session. It is the honest output of
+  what the probe measures and the wrong answer for the person reading it — a
+  headless SSH user is told they are fine when nothing can work.
 - Whether a modifier can be part of a Windows binding at all is unsettled. The
   default avoids the question; a user who sets one still meets it, since the
   injector must assert a modifier key-up before every synthetic event on
@@ -224,5 +234,6 @@ speech endpoint the Claude Code IDE extension uses for its dictation button.
 - App icon, README banner, and a tag-triggered release workflow that builds,
   verifies and publishes the bundle.
 
-[Unreleased]: https://github.com/bygelo/splaude/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/bygelo/splaude/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/bygelo/splaude/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/bygelo/splaude/releases/tag/v0.1.0

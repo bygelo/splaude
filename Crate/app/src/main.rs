@@ -4,6 +4,12 @@
 //! had focus. This is the cross-platform build; macOS also ships a native Swift
 //! app (see `Source/`), which is what the released binaries are today.
 
+/// Gated with `tray`, its only in-crate caller — Linux has no tray, so on Linux
+/// every item here would be dead code. `build.rs` reaches the same source by
+/// `include!` rather than through this module, so the `.ico` it renders and the
+/// tray image are the same drawing.
+#[cfg(not(target_os = "linux"))]
+mod icon;
 mod inject;
 mod take;
 #[cfg(not(target_os = "linux"))]

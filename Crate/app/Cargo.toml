@@ -11,6 +11,22 @@ repository.workspace = true
 name = "splaude"
 path = "src/main.rs"
 
+# `winresource`, the maintained fork of `winres` (last released 2021), is the
+# only dependency here that is not needed at run time: it finds the Windows
+# SDK's `rc.exe` and links the compiled resource into the binary. That last step
+# is why it earns its place — the `.ico` itself is written by hand in
+# `build.rs`, with no image crate involved, but turning one into an
+# RT_GROUP_ICON inside a PE file means invoking a resource compiler, and
+# locating one across MSVC, GNU and cross builds is the whole of what this crate
+# does.
+#
+# Host-gated rather than target-gated, because Cargo resolves a target-specific
+# build dependency against the *host*: a Linux or macOS machine never sees it,
+# and the no-op in `build.rs` covers the remaining case of a Windows host
+# building for something else.
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1.31"
+
 [dependencies]
 anyhow = "1.0.104"
 splaude-core = { version = "0.2.0", path = "../core" }

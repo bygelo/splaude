@@ -65,6 +65,64 @@ enum Setting {
         set { write(newValue, "liveTyping") }
     }
 
+    /// Apps that must be pasted into rather than typed into live.
+    ///
+    /// LiveTyper posts every character on virtual key 0 with the real text
+    /// riding in a unicode payload — that is what makes it layout-independent.
+    /// A remote-desktop or VM client does not read that payload: it re-encodes
+    /// whatever it receives back into scancodes to ship to the guest machine,
+    /// sees keycode 0, and sends `kVK_ANSI_A`. The result is a dictation that
+    /// arrives on the far end as an unbroken run of the letter `a`.
+    ///
+    /// Pasting survives that translation because ⌘V is a genuine keycode, so
+    /// these take the buffered path instead. Matched on bundle identifier and
+    /// not on name — names are localised and get rebranded, identifiers do not.
+    static let builtinPasteOnlyApp = [
+        "com.microsoft.rdc.macos",      // Microsoft Remote Desktop / Windows App
+        "com.microsoft.rdc.mac",        // the older Remote Desktop 8
+        "com.citrix.XenAppViewer",      // Citrix Viewer — the window a session lives in
+        "com.citrix.receiver.nomas",    // Citrix Workspace itself
+        "com.vmware.fusion",
+        "com.parallels.desktop.console",
+        "com.apple.ScreenSharing",
+        "com.apple.RemoteDesktop",
+        "com.teamviewer.TeamViewer",
+        "com.philandro.anydesk",
+        "com.carriez.RustDesk",
+    ]
+
+    /// Apps the user added. Kept separate so the built-in list is never lost.
+    static var customPasteOnlyApp: [String] {
+        get { store.stringArray(forKey: "pasteOnlyApp") ?? [] }
+        set { write(newValue, "pasteOnlyApp") }
+    }
+
+    static var useBuiltinPasteOnlyApp: Bool {
+        get { store.object(forKey: "useBuiltinPasteOnlyApp") as? Bool ?? true }
+        set { write(newValue, "useBuiltinPasteOnlyApp") }
+    }
+
+    /// What a take is actually classified against.
+    static var pasteOnlyApp: [String] {
+        (useBuiltinPasteOnlyApp ? builtinPasteOnlyApp : []) + customPasteOnlyApp
+    }
+
+    /// Whether a take starting in this app has to be buffered and pasted.
+    ///
+    /// Pure and list-injected so the rule can be tested without a desktop in
+    /// front of it. Bundle identifiers are compared case-insensitively because
+    /// the file system they come from is, and a vendor changing `RustDesk` to
+    /// `rustdesk` between builds must not silently un-fix the bug.
+    static func isPasteOnly(_ bundleIdentifier: String?, within app: [String]) -> Bool {
+        guard let bundleIdentifier, !bundleIdentifier.isEmpty else { return false }
+        let subject = bundleIdentifier.lowercased()
+        return app.contains { $0.lowercased() == subject }
+    }
+
+    static func isPasteOnly(_ bundleIdentifier: String?) -> Bool {
+        isPasteOnly(bundleIdentifier, within: pasteOnlyApp)
+    }
+
     /// Microseconds between synthetic keystrokes. Lower is snappier; too low
     /// and Electron apps start dropping characters.
     static var typingInterval: Int {

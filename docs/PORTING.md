@@ -109,18 +109,18 @@ model, not a port of this one. It is out of scope.
 
 ## Done
 
-- `Crate/core` (70 tests) — the speech backend with its wire contract
+- `Crate/core` (97 tests) — the speech backend with its wire contract
   preserved verbatim, credential loading and health classification, settings,
   the transcript buffer, keyterm packing, quota inspection, diagnostics, and
   the live-typing diff extracted as pure logic. Ten of those drive the socket
   loop against a local WebSocket server rather than Anthropic, which is what
   caught a hand-built upgrade request that would have failed every connection.
-- `Crate/platform` (63 tests) — every OS binding. Audio capture on `cpal` with a
+- `Crate/platform` (87 tests) — every OS binding. Audio capture on `cpal` with a
   hand-rolled windowed-sinc resampler standing in for `AVAudioConverter`; the
   push-to-talk hotkey on `global-hotkey`, reporting both edges; text injection
   on `enigo`; the focus guard; launch at login. Only the last two needed
   per-OS code.
-- `Crate/app` (17 tests) — a binary on a `tao` main-thread event loop.
+- `Crate/app` (33 tests) — a binary on a `tao` main-thread event loop.
   `splaude` runs the dictation loop and lives in the tray; `splaude --check`
   reports credential, capability and settings state without opening a window, a
   microphone or a loop, so it is safe over SSH and in CI.
@@ -130,58 +130,70 @@ model, not a port of this one. It is out of scope.
   is the only orderly shutdown path — `Ctrl+C` never reaches `LoopDestroyed`,
   so the hotkey stays registered with the OS and that chord is dead for every
   other app until the session ends.
+- Behaviour parity with the Mac app: tap-to-latch at the same 400 ms threshold,
+  Return ending a take, a start/stop tone, the Test Paste diagnostic, quota
+  reported rather than merely logged, and the settings file opened and reloaded
+  from the menu.
+- Packaging. The release workflow publishes a Windows `.exe` and a Linux
+  `.tar.gz` alongside the macOS bundle, on tag.
 
 ## Verified, and not
 
-Confirmed against a live Windows machine: `splaude --check` reads a real Claude
-Code credential out of `~/.claude/.credentials.json`; the tray icon renders in
-the notification area; its tooltip and menu open and read correctly. CI compiles
+**Windows dictates end to end.** Hold the key, talk, release, and the text
+lands at the cursor in a real editor — hotkey, microphone, socket against the
+live endpoint, live typing, the credential read out of
+`~/.claude/.credentials.json`. The tray renders and its menu works. CI compiles
 the whole workspace on Linux, macOS and Windows.
 
-**The dictation loop itself has never run.** No hotkey has been pressed, no
-socket opened against the real endpoint, no microphone captured — the
-development box exposes no capture device over its remote session. The suite is
-green and every extractable piece of logic is tested, but the OS integration is
-verified by reading platform documentation and by the compiler, not by use.
-Treat the run path as unproven until someone holds the hotkey on a machine with
-a microphone and a desktop session.
+That matters more for what it taught than for the milestone. **Every
+user-visible bug this port has had came from that use, and not one was
+reachable from the suite** — 217 green tests did not catch a held modifier
+leaking spaces into a sentence, `Alt+Backspace` undoing each live-typing
+correction, a remote desktop turning a take into a run of `a`, a byte-order
+mark silently discarding the settings file, or a short take losing its tail.
+Each was found by a person holding a key, and each is fixed. Read the suite as
+protection against regression, not as evidence anything works.
 
-Two specifics that need that machine to settle:
+Still unproven, and needing a person rather than a runner:
 
-- **The held-modifier defence is load-bearing and unobserved.** Windows and X11
-  expose no per-event modifier mask, so the injector asserts a key-up for each
-  modifier before every synthetic event — otherwise `Ctrl+Backspace` deletes a
-  word at a time while push-to-talk is held. Consequences: a hotkey layer that
-  detects release by polling key state may see the chord end early, and on
-  Windows a lone Alt key-up can activate a menu bar.
-- **The tray is seen, but not exercised.** The icon and menu render; nothing has
-  confirmed that the level meter moves, that the transcript item copies, that
-  Reveal Log lands on the right file, or that launch at login survives a
-  restart.
+- **Linux and macOS have never been launched.** Both compile in CI. Nobody has
+  pressed the key on either.
+- **Several Windows surfaces have never been exercised**: both tap gestures,
+  the Return hook, Test Paste, the tone, the quota line, Reload Settings, and
+  what a refused rebind looks like from the front. The level meter moving, the
+  transcript item copying, and launch at login surviving a restart are equally
+  unconfirmed.
+- **Whether a modifier can be part of a Windows binding at all.** The default
+  is now a bare `F9` precisely because both ways of handling a held modifier
+  were tried against a live take and observed failing. A user who sets a
+  modified binding still meets the problem.
 
 The macOS hotkey blocker recorded here previously is **resolved**. It was never
 a platform problem: `global-hotkey` wants its manager on the main thread on
 macOS and pinned to the thread owning its hidden window on Windows, and the
 listener spawned its own thread only because the app had no event loop to
 borrow. Introducing one satisfies both, and CI now compiles the result on
-`macos-15`. Nobody has pressed the key on a Mac.
+`macos-15`.
 
 ## Not done
 
-- The floating mic button and the settings window. Settings are the JSON file
-  at `Setting::path()`, which is deliberate — the Swift build made the same
-  trade with `defaults` — but a window would need a widget toolkit, and `tao`
-  supplies a window, not controls. That is the largest open dependency
-  question in the project.
-- Behaviour parity with the Mac app: tap-to-latch, Return ending a take, a
-  start/stop sound, and the Test Paste diagnostic.
+- The floating mic button and the settings window. The menu now opens and
+  reloads the JSON file at `Setting::path()`, which covers most of what a
+  window would have given — but a real one needs a widget toolkit, and `tao`
+  supplies a window, not controls. Every candidate wants the main-thread event
+  loop `tao` already owns, so this is a migration on its own branch, not a
+  feature. It remains the largest open dependency question in the project.
 - No tray on Linux, deliberately. `tray-icon` there is a hard GTK3 and
   libappindicator dependency that still renders nothing on a desktop with no
   appindicator host, which stock GNOME is.
 - macOS secret-store credential source. The file fallback covers Windows and
   Linux completely and most macOS installs.
-- Packaging for three platforms. CI checks all three, but the release workflow
-  still builds and publishes the macOS Swift bundle only, on tag.
+- A Windows executable icon. The tray mark is drawn at runtime; the `.exe`
+  itself still shows the default, which needs a build script and a resource
+  compiler rather than any of the code above.
+- On Windows, splaude will physically press Return if a transcript ever
+  contains a newline — `enigo` special-cases `\n` with a real key click instead
+  of a unicode payload. Latent, and not fixed.
 - One inherited bug is carried deliberately rather than fixed under cover of a
   rewrite — see *Known issues* in [CHANGELOG.md](../CHANGELOG.md).
 
@@ -213,8 +225,8 @@ cargo run -p splaude-app -- --check    # credential and capability report
 cargo build --release                  # target/release/splaude
 ```
 
-The Swift build is untouched by any of this and still builds with `make`, and
-now has 23 tests of its own via `swift test`. Both suites run on every push and
-pull request through the `Check` workflow, across Linux, macOS and Windows —
-all four legs green, so the workspace is confirmed to build and pass on every
-target platform even though only the macOS app is usable yet.
+The Swift build still builds with `make` and now has 32 tests of its own via
+`swift test`. It is mostly untouched by the port, the exception being fixes
+that apply to both builds — the remote-desktop paste carve-out is in each.
+Both suites run on every push and pull request through the `Check` workflow,
+across Linux, macOS and Windows, all four legs green.

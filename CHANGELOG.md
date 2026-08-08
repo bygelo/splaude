@@ -57,8 +57,62 @@ Notable changes to splaude. Format follows
   Quit — which is the only orderly shutdown path, and therefore the only one
   that unregisters the hotkey. Every one of these was already implemented in
   `core` or `platform` and had no caller; the work was wiring.
+- Downloadable builds. The release workflow now publishes a Windows `.exe` and
+  a Linux `.tar.gz` alongside the macOS bundle, so the Rust build is something
+  people can run rather than something they must compile.
+- Tap to latch, at the Swift build's own 400 ms threshold — the one value that
+  has shipped and been lived with. Holding still works; a tap starts a take and
+  leaves it running, and a second tap ends it.
+- Return ends the take on Windows, through a low-level keyboard hook that
+  observes and never swallows the key. It stands itself down if the hotkey is
+  Enter, and it keys off a marker splaude stamps on its own events rather than
+  the injected flag, so a user driving their keyboard through PowerToys or an
+  on-screen keyboard is still a user pressing Return.
+- Test Paste in the menu — types a known string through the same injector,
+  carve-out and fallback a real take uses, with no microphone, socket or
+  credential involved. Injection is the least verified part of this app and has
+  produced every user-visible bug so far.
+- A start and stop tone, synthesised through the output device `cpal` already
+  provides, so no new dependency. Off by default, as on macOS.
+- Quota has an answer rather than a log line. The README's central claim is
+  that dictation does not spend Claude quota, and the handshake headers are the
+  evidence — until now they only ever reached the log. Reported in `--check`
+  and in the menu, keeping "never asked" and "asked and saw nothing" as
+  separate readings, because the second is evidence and the first is silence.
+- Edit Settings, which writes the current state out first if the file does not
+  exist so the editor never opens nothing; and Reload Settings, which re-reads
+  it, rebinds the hotkey, reconciles launch-at-login against the machine, and
+  refuses mid-take rather than moving a binding under a held key. This is the
+  first caller `HotkeyListener::rebind` has ever had.
+- A carve-out for applications that re-encode a keystroke by its keycode
+  instead of reading the unicode payload it carries — remote desktop and VM
+  clients. Fourteen are recognised by executable name, and the list is
+  extensible from the settings file.
 
 ### Fixed
+
+- Dictation into a Remote Desktop window produced a run of `a` instead of the
+  transcript. Synthetic text is delivered on virtual key 0 with the codepoint
+  as its payload, which is what makes typing layout-independent; a remote
+  desktop client re-encodes keyboard input into scancodes, reads the keycode,
+  and sends whatever key 0 is — on macOS, `kVK_ANSI_A`. splaude now pastes into
+  those applications rather than typing at them, in both the Rust and Swift
+  builds.
+- Long takes lost their tail. The recogniser was fed faster than real time, so
+  a take could be closed while audio was still undecoded. Audio is now paced
+  against the wall clock with a small lead, which also bounds how far ahead the
+  client can ever get.
+- A byte-order mark silently discarded every setting. Notepad and PowerShell's
+  `Out-File -Encoding utf8` both write one, `serde_json` rejects it as "expected
+  value at line 1 column 1", and the whole file reverted to defaults over three
+  bytes the user cannot see. Hand-editing is a supported path, so the file has
+  to survive the editors people actually have.
+- A settings file that fails to parse is now named, in the log, in `--check`
+  and in the menu, instead of silently reverting to defaults. Nothing rewrites
+  it — the broken text is the user's edit and it is what they need to see — a
+  reload refuses outright and keeps what is already running, and toggling
+  launch-at-login no longer saves defaults over a file it could not read, which
+  would have destroyed a keyterm list as a side effect of clicking a checkbox.
 
 - The Rust speech backend built its upgrade request by hand, which skipped
   `Sec-WebSocket-Key`, `Upgrade` and `Connection`, so every connection would
@@ -77,6 +131,19 @@ Notable changes to splaude. Format follows
   meaning on another platform.
 - The live-typing diff moves into `Crate/core` as pure logic. It never needed
   an OS — it was portable code sitting in a file that also posted `CGEvent`s.
+- Windows defaults to a bare `F9` rather than macOS's `Alt+/`, and the reason
+  is not taste. A modified binding needs its modifier held for the OS to keep
+  matching the chord. macOS obliges — synthetic events carry their own flags,
+  so the physical modifier is never touched. Windows has no per-event modifier
+  mask, which forces a choice, and both options were tried against a live take
+  and observed failing: release the modifier and the still-held key falls
+  through and auto-repeats, so a take on `Alt+Space` came back shot through
+  with spaces mid-word; hold it and every keystroke inherits it, and since
+  `Alt+Backspace` is undo in a great many applications, each live-typing
+  correction wiped the sentence before it. There is no safe modifier —
+  `Ctrl+Backspace` deletes a word, `Shift` uppercases, `Win` turns every
+  keystroke into a shortcut. A binding with no modifier has nothing to release
+  and nothing to inherit.
 
 ### Known issues
 
@@ -88,22 +155,33 @@ Notable changes to splaude. Format follows
   deliberately rather than changed under cover of a rewrite; the Rust test
   `a_longer_contradicting_target_may_only_append_past_the_lock` pins the
   current behaviour and names it as a divergence.
-- The dictation loop has never run. `splaude --check` is confirmed against a
-  real machine; the run path is not. No hotkey has been pressed, no socket
-  opened against the endpoint, no microphone captured — so the OS integration
-  is verified by the compiler and by platform documentation, not by use.
-- The injector's held-modifier defence asserts a modifier key-up before every
-  synthetic event on Windows and Linux, because neither exposes a per-event
-  modifier mask. A hotkey layer that polls key state may therefore see the
-  chord end early, and a lone Alt key-up can activate a Windows menu bar. Both
-  beat deleting the user's words a word at a time; neither has been observed.
-- The tray renders, but nothing beyond that is confirmed: not the level meter
-  moving, not the transcript item copying, not Reveal Log landing on the right
-  file, not launch at login surviving a restart.
+- The Rust build has only ever run on Windows. Dictation there is confirmed
+  end to end — hotkey, microphone, socket, live typing into a real editor — and
+  every bug fixed above came from that use, not from the suite. Linux and macOS
+  compile in CI and have never been launched.
+- Whether a modifier can be part of a Windows binding at all is unsettled. The
+  default avoids the question; a user who sets one still meets it, since the
+  injector must assert a modifier key-up before every synthetic event on
+  Windows and Linux and neither platform exposes a per-event mask.
+- Several surfaces have never been exercised by a person: both tap gestures,
+  the Return hook, Test Paste, the tone, the quota line, Reload Settings, and
+  what a refused rebind looks like from the front. The level meter, the
+  transcript copy and launch-at-login surviving a restart are equally unproven.
+- On Windows, splaude will physically press Return if a transcript ever
+  contains a newline. `enigo`'s typing path special-cases `\n` with a real key
+  click rather than a unicode payload. Not the Return hook's doing, and not
+  fixed here.
+- Two `rebind` failures are logged and not recoverable: an unregister that
+  fails while the new registration succeeds leaves the old chord dead for every
+  other application, and a new binding that is refused whose restore also fails
+  leaves no hotkey and no way back but a restart. Neither is reachable from an
+  ordinary edit.
 - `tao` puts GTK3 and D-Bus on Linux, which is the dependency `tray-icon` is
   excluded there to avoid. Whether Linux needs the event loop at all is open —
   `global-hotkey` spins its own thread on X11.
-- Still no floating mic and no settings window; settings are the JSON file. See
+- Still no floating mic and no settings window. Settings are the JSON file,
+  which the menu now opens and reloads; a real window wants a toolkit that does
+  not fight `tao` for the main thread, and that is its own change. See
   [docs/PORTING.md](docs/PORTING.md).
 
 ## [0.1.0] — 2026-07-31

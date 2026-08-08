@@ -84,6 +84,11 @@ Notable changes to splaude. Format follows
   it, rebinds the hotkey, reconciles launch-at-login against the machine, and
   refuses mid-take rather than moving a binding under a held key. This is the
   first caller `HotkeyListener::rebind` has ever had.
+- `splaude.exe` carries the splaude mark in Explorer, the taskbar and Alt-Tab,
+  rendered at build time from the same pixel math the tray uses rather than
+  from a committed image a human regenerates by hand. A second copy of a mark
+  is a copy that drifts, which is the whole reason `Script/makeicon.swift`
+  exists on the macOS side.
 - A carve-out for applications that re-encode a keystroke by its keycode
   instead of reading the unicode payload it carries — remote desktop and VM
   clients. Fourteen are recognised by executable name, and the list is

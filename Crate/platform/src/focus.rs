@@ -143,7 +143,12 @@ fn is_modal_state(flag: u32) -> bool {
 
 #[cfg(windows)]
 mod backend {
-    use windows::Win32::Foundation::HWND;
+    use windows::core::PWSTR;
+    use windows::Win32::Foundation::{CloseHandle, HWND};
+    use windows::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+        PROCESS_QUERY_LIMITED_INFORMATION,
+    };
     use windows::Win32::UI::WindowsAndMessaging::{
         GetClassNameW, GetForegroundWindow, GetGUIThreadInfo, GetWindowThreadProcessId,
         GUITHREADINFO,
@@ -153,6 +158,10 @@ mod backend {
 
     /// Long enough for any registered class name; `RegisterClass` caps at 256.
     const CLASS_BUFFER: usize = 256;
+
+    /// `MAX_PATH` is not the limit for a process image path — long paths are
+    /// legal — so this is sized for one rather than for the legacy 260.
+    const PATH_BUFFER: usize = 32_768;
 
     pub fn is_supported() -> bool {
         true
@@ -201,6 +210,68 @@ mod backend {
 
         let class = class_of(window).unwrap_or_else(|| "unknown".to_string());
         Some(format!("{process}:{class}:{:#x}", window.0 as usize))
+    }
+
+    /// The foreground process's own file name, e.g. `mstsc.exe`.
+    ///
+    /// Deliberately the *process*, not the window: the callers that care want to
+    /// know which application is on the other side of the keystroke, and the
+    /// window class cannot tell them — a remote-desktop client is one opaque
+    /// HWND like every other modern framework.
+    pub fn executable() -> Option<String> {
+        let foreground = {
+            // SAFETY: no arguments; returns a null handle on a session with no
+            // foreground window, which `is_invalid` catches.
+            let window = unsafe { GetForegroundWindow() };
+            if window.is_invalid() {
+                return None;
+            }
+            window
+        };
+
+        let mut process = 0u32;
+        // SAFETY: `window` is non-null and the out-parameter points at a live
+        // local that outlives the call.
+        unsafe { GetWindowThreadProcessId(foreground, Some(&mut process)) };
+        if process == 0 {
+            return None;
+        }
+
+        // QUERY_LIMITED_INFORMATION is the least privilege that still answers
+        // this question, and unlike QUERY_INFORMATION it is granted across
+        // integrity levels — an elevated remote-desktop window would otherwise
+        // be invisible to us.
+        // SAFETY: takes a process id by value and returns a handle or an error;
+        // nothing is borrowed.
+        let handle =
+            unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, process) }.ok()?;
+
+        // Heap, not stack: 64 KiB is more than some worker threads get.
+        let mut buffer = vec![0u16; PATH_BUFFER];
+        let mut length = buffer.len() as u32;
+        // SAFETY: `handle` is live until the `CloseHandle` below, and the
+        // pointer/length pair describes the exclusively-borrowed local buffer,
+        // which is the whole contract of this call. It writes the used length
+        // back through `length`.
+        let queried = unsafe {
+            QueryFullProcessImageNameW(
+                handle,
+                PROCESS_NAME_WIN32,
+                PWSTR(buffer.as_mut_ptr()),
+                &mut length,
+            )
+        };
+        // SAFETY: `handle` came from `OpenProcess`, is still open, and is not
+        // used again after this point.
+        let _ = unsafe { CloseHandle(handle) };
+        queried.ok()?;
+
+        let path = String::from_utf16_lossy(&buffer[..length as usize]);
+        // The API answers with a full path; only the leaf names the program.
+        // Split on both separators because the Win32 form uses backslashes and
+        // nothing forbids the other one.
+        let name = path.rsplit(['\\', '/']).next().unwrap_or(&path).trim();
+        (!name.is_empty()).then(|| name.to_string())
     }
 
     /// Focus is per-thread on Windows, and only the foreground thread's focus
@@ -270,6 +341,13 @@ mod backend {
     pub fn anchor() -> Option<String> {
         None
     }
+
+    /// `NSWorkspace.frontmostApplication` would answer this without the
+    /// Accessibility API, but that is AppKit FFI this crate does not carry yet.
+    /// `None` means "cannot tell", and callers proceed as normal.
+    pub fn executable() -> Option<String> {
+        None
+    }
 }
 
 // MARK: - Linux
@@ -300,6 +378,14 @@ mod backend {
     pub fn anchor() -> Option<String> {
         None
     }
+
+    /// Naming the foreground process means naming the foreground window first,
+    /// which is the introspection Wayland exists to refuse and X11 only answers
+    /// for cooperating clients. `None` means "cannot tell", and callers proceed
+    /// as normal.
+    pub fn executable() -> Option<String> {
+        None
+    }
 }
 
 /// Whether this platform can distinguish a text field at all.
@@ -321,6 +407,16 @@ pub fn verdict() -> FocusVerdict {
 /// follow focus mid-sentence. `None` when the platform cannot tell.
 pub fn anchor() -> Option<String> {
     backend::anchor()
+}
+
+/// The file name of the process behind the foreground window, e.g. `mstsc.exe`.
+///
+/// `None` is "cannot tell", not "nothing there" — it is what macOS and Linux
+/// always answer, and what Windows answers when there is no foreground window.
+/// Every caller must read it as permission to proceed as normal, because the
+/// alternative is changing behaviour on two platforms that never asked.
+pub fn executable() -> Option<String> {
+    backend::executable()
 }
 
 #[cfg(test)]
@@ -446,6 +542,7 @@ mod test {
     fn the_probe_answers_without_a_session() {
         let _ = is_supported();
         let _ = anchor();
+        let _ = executable();
         // Nothing about the verdict is asserted — a headless runner has no
         // foreground window, and a developer machine does.
         let _ = verdict();

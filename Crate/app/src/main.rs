@@ -19,7 +19,7 @@ use tao::event_loop::{ControlFlow, EventLoopBuilder};
 
 use splaude_core::credential::Store;
 use splaude_core::{diagnostic, Setting};
-use splaude_platform::{autostart, Capability, HotkeyEdge, HotkeyListener};
+use splaude_platform::{autostart, focus, Capability, HotkeyEdge, HotkeyListener};
 use take::{Report, Take};
 
 /// How often the credential is re-read, matching the Swift build's timer.
@@ -404,6 +404,16 @@ fn check() -> Result<()> {
     println!("  hotkey    {}", setting.hotkey);
     println!("  language  {}", setting.language);
     println!("  live typing {}", mark(setting.live_typing));
+    // Names whatever is in front right now, and says whether a take aimed at it
+    // would be buffered. A user whose dictation arrives as a run of `a` in a
+    // remote-desktop window needs a way to see that from outside the log.
+    match focus::executable() {
+        Some(name) if setting.is_keycode_app(&name) => {
+            println!("  foreground {name} — buffered, it re-encodes keystrokes by keycode")
+        }
+        Some(name) => println!("  foreground {name}"),
+        None => println!("  foreground  (this platform cannot name it)"),
+    }
     println!("  file      {}", Setting::path().display());
     println!("  log       {}", diagnostic::path().display());
 

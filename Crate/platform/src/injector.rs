@@ -14,6 +14,16 @@
 //! `Ctrl+Backspace` on Windows both eat a whole word instead of a character,
 //! so a naive injector deletes the user's sentence one word per keystroke. See
 //! `neutralize_modifier` for how each platform is defused.
+//!
+//! **The layout defence is also the remote-desktop wound.** `Keyboard::text`
+//! puts the codepoint in the payload and leaves the keycode at 0. A native app
+//! reads the payload; a remote-desktop or VM client re-encodes keyboard input
+//! into scancodes for the wire, reads the *keycode*, and transmits whatever key
+//! 0 is — `a` on macOS. Nothing about batching changes that: fifty characters
+//! down the same path are fifty wrong characters. [`Injector::paste`] is the
+//! other delivery, and it exists for exactly one reason — a real keycode
+//! survives re-encoding, so the text rides the clipboard and only `Ctrl+V`
+//! (`Cmd+V`) travels as keystrokes.
 
 use std::thread;
 use std::time::Duration;
@@ -31,6 +41,42 @@ const CHUNK_CHAR: usize = 16;
 /// Meta+Backspace are destructive in enough editors to be worth clearing too.
 #[cfg(not(target_os = "macos"))]
 const MODIFIER: [Key; 4] = [Key::Control, Key::Alt, Key::Shift, Key::Meta];
+
+/// The modifier half of the paste chord. `Cmd` on macOS, `Ctrl` everywhere
+/// else. Sent through `key`, not `text`, because that is the entire point of
+/// the paste path: `key` emits a keycode a remote-desktop client can re-encode,
+/// `text` emits a payload it throws away.
+#[cfg(target_os = "macos")]
+const PASTE_MODIFIER: Key = Key::Meta;
+#[cfg(all(not(target_os = "macos"), not(target_os = "linux")))]
+const PASTE_MODIFIER: Key = Key::Control;
+
+/// The `V` of the chord, as the platform's own virtual keycode — `kVK_ANSI_V`
+/// on macOS, exactly the `9` in `TextInserter.swift`; `VK_V` on Windows.
+///
+/// Not `Key::Unicode('v')`, which would look more layout-aware and is in fact
+/// the fragile choice here. Both platforms resolve that through the *active*
+/// layout, and a layout with no `v` on it — Russian, Greek, Hebrew — has
+/// nothing to resolve it to. enigo then falls back to entering it as unicode
+/// text, which is the very payload-on-keycode-0 mechanism this path exists to
+/// avoid, so the chord would arrive at a remote desktop as `Ctrl` plus
+/// whatever key 0 is, and the paste would silently not happen. The letter keys
+/// keep their ANSI keycodes under every layout, and paste is bound to the
+/// keycode, so the constant is both simpler and more correct.
+#[cfg(target_os = "macos")]
+const PASTE_KEY: Key = Key::Other(9);
+#[cfg(all(not(target_os = "macos"), not(target_os = "linux")))]
+const PASTE_KEY: Key = Key::Other(0x56);
+
+/// How long the focused application gets to read the clipboard before the
+/// previous contents go back. The same 0.35 s `TextInserter.swift` waits, and
+/// for the same reason: the paste is asynchronous — the keystroke has only been
+/// posted, not consumed — and restoring too early hands the app the *old*
+/// clipboard to paste. The injector runs on a thread of its own whose only job
+/// is delivery, and the take is over by the time this runs, so blocking here
+/// costs nothing the user can perceive.
+#[cfg(not(target_os = "linux"))]
+const CLIPBOARD_SETTLE_MILLIS: u64 = 350;
 
 pub struct Injector {
     enigo: Enigo,
@@ -93,6 +139,111 @@ impl Injector {
         }
 
         Ok(())
+    }
+
+    /// Delivers `text` by putting it on the clipboard and sending the paste
+    /// chord as real keycodes.
+    ///
+    /// For applications that re-encode keystrokes by keycode, where
+    /// [`Injector::type_text`] cannot work by construction. It is not the
+    /// default delivery and should not become one: it costs the user their
+    /// clipboard for a third of a second, and cannot always give it back.
+    ///
+    /// The clipboard is snapshotted and restored, but only as text — the
+    /// `arboard` dependency here is built without `image-data`, so an image or
+    /// a file list on the clipboard is not something this can round-trip. When
+    /// the snapshot fails, nothing is put back and the take's text stays on the
+    /// clipboard, which is the honest outcome: the old contents were already
+    /// overwritten by the time we knew, and leaving the user's own words there
+    /// beats leaving an empty clipboard.
+    #[cfg(not(target_os = "linux"))]
+    pub fn paste(&mut self, text: &str) -> Result<()> {
+        if text.is_empty() {
+            return Ok(());
+        }
+
+        let mut clipboard =
+            arboard::Clipboard::new().context("could not open the system clipboard")?;
+
+        // `Err` here is "nothing we can put back" — an empty clipboard, or a
+        // format this build cannot read. Not a reason to refuse the paste.
+        let previous = clipboard.get_text().ok();
+
+        clipboard
+            .set_text(text)
+            .context("could not put the take on the clipboard")?;
+
+        let struck = self.paste_chord();
+
+        // Restored whether or not the chord went out. A failed chord means the
+        // caller is about to type the text instead, and it should not also
+        // inherit a stomped clipboard.
+        if let Some(previous) = previous {
+            thread::sleep(Duration::from_millis(CLIPBOARD_SETTLE_MILLIS));
+            if let Err(error) = clipboard.set_text(previous) {
+                splaude_core::diagnostic::log(
+                    "type",
+                    format!("could not restore the clipboard after pasting: {error}"),
+                );
+            }
+        }
+
+        struck
+    }
+
+    /// Linux has no paste path, and this is a refusal rather than a gap.
+    ///
+    /// The only caller is the carve-out for keycode-translating applications,
+    /// and that is driven by [`crate::focus::executable`], which answers `None`
+    /// on Linux — there is no way to name the foreground process on Wayland at
+    /// all, and only for cooperating clients on X11. So this is unreachable in
+    /// practice, and pulling an X11 clipboard owner into a build that would
+    /// never use it is a dependency for nothing. An error rather than a silent
+    /// `Ok`: if the carve-out ever does reach here, the caller falls back to
+    /// typing and the log says why, instead of the take vanishing.
+    #[cfg(target_os = "linux")]
+    #[allow(clippy::unused_self)]
+    pub fn paste(&mut self, _text: &str) -> Result<()> {
+        anyhow::bail!(
+            "pasting is not implemented on Linux — no clipboard backend is \
+             compiled in for this platform"
+        )
+    }
+
+    /// Sends the platform's paste chord as real keycodes.
+    ///
+    /// The interaction with `neutralize_modifier` is the part that is easy to
+    /// get silently wrong. It is called **once, before the chord opens**, and
+    /// never inside it. Before, because push-to-talk means the user is
+    /// physically holding a modifier: leave `Alt` down and `Ctrl+V` is read as
+    /// `Ctrl+Alt+V`, which is somebody's macro and not a paste. Never inside,
+    /// because the chord's own modifier is one of the keys `neutralize_modifier`
+    /// releases — asserting a key-up for `Ctrl` between pressing it and striking
+    /// `V` would hand the application a bare `v`, and the take would vanish
+    /// leaving a single letter behind. That is why this does not reuse the
+    /// per-event clearing `type_text` and `backspace` do.
+    #[cfg(not(target_os = "linux"))]
+    fn paste_chord(&mut self) -> Result<()> {
+        self.neutralize_modifier()?;
+
+        self.enigo
+            .key(PASTE_MODIFIER, Direction::Press)
+            .context("could not hold the paste modifier")?;
+
+        let struck = self
+            .enigo
+            .key(PASTE_KEY, Direction::Click)
+            .context("could not send the paste chord to the focused application");
+
+        // Released unconditionally. A modifier left stuck down after a failed
+        // keystroke turns the user's next real keypress into a shortcut, which
+        // is a far worse state to leave the machine in than a lost paste.
+        let released = self
+            .enigo
+            .key(PASTE_MODIFIER, Direction::Release)
+            .context("could not release the paste modifier");
+
+        struck.and(released)
     }
 
     /// macOS needs nothing here: the private event source configured in `new`

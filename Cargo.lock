@@ -2172,6 +2172,7 @@ name = "splaude-platform"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "arboard",
  "cpal",
  "dirs",
  "enigo",

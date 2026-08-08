@@ -31,6 +31,20 @@ pub enum Command {
         text: String,
         interval_micros: u32,
     },
+    /// The push-to-talk chord moved. Sent by a settings reload, and the reason
+    /// this is a command rather than a constructor argument: the injector must
+    /// leave the *live* binding's modifier alone and clear every other one, so
+    /// a rebind that never reached here would keep excluding a key the user no
+    /// longer holds and start clearing one they do.
+    ///
+    /// Reload Settings is reached from the tray, which the Linux build does not
+    /// have, so there this variant exists and nothing constructs it. Keeping the
+    /// command shared rather than gating it means the injector answers the same
+    /// vocabulary on every platform.
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
+    Bind {
+        binding: splaude_core::Hotkey,
+    },
 }
 
 /// Starts the injector thread. Dropping the returned sender ends it.
@@ -39,9 +53,9 @@ pub enum Command {
 /// The injector needs it to know which held modifier it must *not* release —
 /// see `splaude_platform`'s injector for why releasing that one leaks the user's
 /// held key into the take. It is passed here rather than sent as a command
-/// because the thread below owns the injector from the moment it starts, and
-/// nothing in this build rebinds at runtime; when something does, the rebind
-/// must reach the injector too, which means a command for it.
+/// because the thread below owns the injector from the moment it starts. A
+/// later rebind reaches it as [`Command::Bind`], which is the same value
+/// arriving down the same channel rather than a second way to set it.
 pub fn spawn(binding: splaude_core::Hotkey) -> Result<Sender<Command>> {
     // Built here rather than on the thread so a missing permission (macOS
     // Accessibility, a Wayland session) surfaces as a startup error the user can
@@ -82,6 +96,11 @@ pub fn spawn(binding: splaude_core::Hotkey) -> Result<Sender<Command>> {
                             injector.type_text(&text, interval_micros)
                         }
                     },
+
+                    Command::Bind { binding } => {
+                        injector.set_binding(binding);
+                        Ok(())
+                    }
                 };
 
                 // A failed keystroke loses a word; a panicking thread loses

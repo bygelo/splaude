@@ -17,7 +17,7 @@ use anyhow::{anyhow, Result};
 use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
-use splaude_core::diagnostic;
+use splaude_core::{diagnostic, quota, Setting};
 
 /// Re-exported so `main.rs` can name it without depending on `tray-icon`
 /// directly — the whole point being that on Linux neither exists.
@@ -39,6 +39,9 @@ const QUIT: &str = "splaude:quit";
 const TRANSCRIPT: &str = "splaude:transcript";
 const REVEAL_LOG: &str = "splaude:reveal-log";
 const AUTOSTART: &str = "splaude:autostart";
+const TEST_PASTE: &str = "splaude:test-paste";
+const EDIT_SETTING: &str = "splaude:edit-setting";
+const RELOAD_SETTING: &str = "splaude:reload-setting";
 
 /// Longest transcript preview the menu will show, in characters.
 ///
@@ -160,6 +163,12 @@ pub enum Ask {
     CopyTranscript,
     RevealLog,
     ToggleAutostart,
+    /// Type a known string into whatever has focus, exercising injection alone.
+    TestPaste,
+    /// Open the settings file in whatever edits JSON on this machine.
+    EditSetting,
+    /// Re-read the settings file and apply what can be applied live.
+    ReloadSetting,
     /// A click on a label, or on an id from some other `muda` consumer.
     Ignore,
 }
@@ -170,6 +179,8 @@ pub struct Tray {
     hotkey: String,
     /// The credential sentence, or `None` when there is nothing worth saying.
     health: Option<String>,
+    /// What is wrong with the settings file, or `None` when it read cleanly.
+    note: Option<String>,
     /// The last take's committed text in full. The menu shows a clipped
     /// preview; the clipboard gets all of it.
     transcript: Option<String>,
@@ -199,6 +210,7 @@ impl Tray {
             mood: Mood::Idle,
             hotkey: hotkey.to_string(),
             health,
+            note: None,
             transcript: None,
             autostart,
         };
@@ -252,6 +264,38 @@ impl Tray {
         self.redraw_menu();
     }
 
+    /// Show, update, or drop the settings-file complaint.
+    ///
+    /// The point of the item is that a hand-edited file which failed to parse
+    /// stops being a silent revert to defaults. A user who mistyped a comma has
+    /// lost their hotkey and their keyterms, and this is the only place they
+    /// would find out without opening the log.
+    pub fn set_note(&mut self, note: Option<String>) {
+        if self.note == note {
+            return;
+        }
+        self.note = note;
+        self.redraw_menu();
+    }
+
+    /// Rename the push-to-talk key in the label and the tooltip, after a
+    /// reload moved it.
+    pub fn set_hotkey(&mut self, hotkey: &str) {
+        if self.hotkey == hotkey {
+            return;
+        }
+        self.hotkey = hotkey.to_string();
+        let _ = self
+            .icon
+            .set_tooltip(Some(tooltip(self.mood, &self.hotkey)));
+        self.redraw_menu();
+    }
+
+    /// Rebuild so the quota line is re-read. Nothing else here changes.
+    pub fn refresh(&self) {
+        self.redraw_menu();
+    }
+
     pub fn set_autostart(&mut self, enabled: bool) {
         if self.autostart == enabled {
             return;
@@ -295,6 +339,15 @@ impl Tray {
         // as broken.
         if let Some(line) = &self.health {
             append(&menu, &MenuItem::new(line, false, None))?;
+        }
+        // Beside the credential warning rather than beside the settings items:
+        // both are the same kind of statement — something the app needs is not
+        // in the state you think it is — and both are read before anything is
+        // clicked.
+        if let Some(line) = &self.note {
+            append(&menu, &MenuItem::new(line, false, None))?;
+        }
+        if self.health.is_some() || self.note.is_some() {
             append(&menu, &PredefinedMenuItem::separator())?;
         }
 
@@ -308,13 +361,43 @@ impl Tray {
         // Disabled on purpose — it is a label.
         append(
             &menu,
-            &MenuItem::new(format!("Hold {} to dictate", self.hotkey), false, None),
+            &MenuItem::new(
+                format!("Hold {} to talk, or tap to latch", self.hotkey),
+                false,
+                None,
+            ),
+        )?;
+        // Also a label. Read live rather than stored on `Tray`, so it is
+        // current as of whatever rebuilt the menu — a take, a reload, a health
+        // poll — rather than as of whenever the last quota event happened to be
+        // pushed at us.
+        append(
+            &menu,
+            &MenuItem::new(quota_line(&quota::reading()), false, None),
         )?;
         append(&menu, &PredefinedMenuItem::separator())?;
 
         append(
             &menu,
             &CheckMenuItem::with_id(AUTOSTART, "Launch at login", true, self.autostart, None),
+        )?;
+        // The settings pair together, above the diagnostics: the file is the
+        // interface, so opening it and re-reading it are one gesture in two
+        // halves.
+        append(
+            &menu,
+            &MenuItem::with_id(EDIT_SETTING, "Edit Settings…", true, None),
+        )?;
+        append(
+            &menu,
+            &MenuItem::with_id(RELOAD_SETTING, "Reload Settings", true, None),
+        )?;
+        // The two diagnostics together, above the log they write into. A user
+        // who dictated and saw nothing reaches for these in order: prove the
+        // keystrokes land, then read what the take actually did.
+        append(
+            &menu,
+            &MenuItem::with_id(TEST_PASTE, "Test Paste", true, None),
         )?;
         append(
             &menu,
@@ -343,7 +426,70 @@ pub fn ask(id: &MenuId) -> Ask {
         TRANSCRIPT => Ask::CopyTranscript,
         REVEAL_LOG => Ask::RevealLog,
         AUTOSTART => Ask::ToggleAutostart,
+        TEST_PASTE => Ask::TestPaste,
+        EDIT_SETTING => Ask::EditSetting,
+        RELOAD_SETTING => Ask::ReloadSetting,
         _ => Ask::Ignore,
+    }
+}
+
+/// How the handshake's rate-limit evidence reads in a menu.
+///
+/// The README's central claim is that dictation does not spend Claude quota,
+/// and these headers are the whole of the client-side evidence for it: an
+/// endpoint that metered the request answers with `anthropic-ratelimit-*`. Up
+/// to now that evidence only ever reached the log. Pure over the reading so the
+/// wording can be checked without a desktop, a socket or a take.
+fn quota_line(reading: &quota::Reading) -> String {
+    format!("Claude quota: {}", reading.line())
+}
+
+/// Open the settings file in whatever this machine edits JSON with.
+///
+/// Written out first if it is not there. An editor opened on a file that does
+/// not exist shows an empty buffer, which tells the user nothing about what is
+/// configurable and invites them to invent a schema; the current state written
+/// out is both a working file and the documentation for it.
+///
+/// Same shape as [`reveal_log`] — a spawned platform opener, no dependency —
+/// except that this opens the file rather than revealing it, because unlike the
+/// log a `.json` is something the machine plausibly has a handler for.
+pub fn edit_setting(setting: &Setting) {
+    let path = Setting::path();
+
+    if !path.exists() {
+        match setting.save() {
+            Ok(()) => diagnostic::log("setting", format!("wrote {}", path.display())),
+            Err(error) => {
+                diagnostic::log(
+                    "setting",
+                    format!("could not write {}: {error}", path.display()),
+                );
+                return;
+            }
+        }
+    }
+
+    // `start` is a shell builtin, not an executable, so it needs `cmd`. The
+    // empty first argument is the window title `start` would otherwise take the
+    // path for — without it a quoted path becomes the title and nothing opens.
+    #[cfg(target_os = "windows")]
+    let spawned = std::process::Command::new("cmd")
+        .args(["/c", "start", ""])
+        .arg(&path)
+        .spawn();
+
+    #[cfg(target_os = "macos")]
+    let spawned = std::process::Command::new("open").arg(&path).spawn();
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    let spawned = std::process::Command::new("xdg-open").arg(&path).spawn();
+
+    if let Err(error) = spawned {
+        diagnostic::log(
+            "setting",
+            format!("could not open {}: {error}", path.display()),
+        );
     }
 }
 
@@ -815,6 +961,61 @@ mod test {
         assert_eq!(ask(&MenuId::new(TRANSCRIPT)), Ask::CopyTranscript);
         assert_eq!(ask(&MenuId::new(REVEAL_LOG)), Ask::RevealLog);
         assert_eq!(ask(&MenuId::new(AUTOSTART)), Ask::ToggleAutostart);
+        assert_eq!(ask(&MenuId::new(TEST_PASTE)), Ask::TestPaste);
+        assert_eq!(ask(&MenuId::new(EDIT_SETTING)), Ask::EditSetting);
+        assert_eq!(ask(&MenuId::new(RELOAD_SETTING)), Ask::ReloadSetting);
+    }
+
+    #[test]
+    fn the_quota_line_keeps_the_never_dictated_state_distinct() {
+        // Flattening these two would turn "we have not asked yet" into a claim
+        // that nothing was metered, which is the one thing this line must not
+        // say without evidence.
+        let unknown = quota_line(&quota::Reading::Unknown);
+        let unmetered = quota_line(&quota::Reading::Unmetered);
+        assert_ne!(unknown, unmetered);
+        assert!(unknown.contains("dictate once"), "{unknown}");
+        assert!(unmetered.contains("nothing metered"), "{unmetered}");
+    }
+
+    #[test]
+    fn the_quota_line_shows_a_reading_it_was_given() {
+        let line = quota_line(&quota::Reading::Metered(
+            "anthropic-ratelimit-requests-remaining=42".into(),
+        ));
+        assert!(line.contains("42"), "{line}");
+    }
+
+    #[test]
+    fn every_quota_line_fits_a_menu_item() {
+        // A menu is as wide as its widest item, and this one is always present.
+        for reading in [
+            quota::Reading::Unknown,
+            quota::Reading::Unmetered,
+            quota::Reading::Unavailable,
+        ] {
+            let line = quota_line(&reading);
+            assert!(!line.is_empty());
+            assert!(line.chars().count() <= 60, "{line}");
+            assert!(!line.contains('\n'), "{line}");
+        }
+    }
+
+    #[test]
+    fn every_id_is_distinct() {
+        // Two items sharing an id would silently make one of them do the
+        // other's job, and `muda` would not complain.
+        let id = [
+            QUIT,
+            TRANSCRIPT,
+            REVEAL_LOG,
+            AUTOSTART,
+            TEST_PASTE,
+            EDIT_SETTING,
+            RELOAD_SETTING,
+        ];
+        let unique: std::collections::BTreeSet<&str> = id.iter().copied().collect();
+        assert_eq!(unique.len(), id.len());
     }
 
     #[test]

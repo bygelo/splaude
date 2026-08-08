@@ -9,18 +9,36 @@ mod take;
 #[cfg(not(target_os = "linux"))]
 mod tray;
 
+#[cfg(not(target_os = "linux"))]
+use std::sync::mpsc::Sender;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use tao::event::Event;
 #[cfg(not(target_os = "linux"))]
 use tao::event::StartCause;
-use tao::event_loop::{ControlFlow, EventLoopBuilder};
+use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
 
 use splaude_core::credential::Store;
-use splaude_core::{diagnostic, Setting};
-use splaude_platform::{autostart, focus, Capability, HotkeyEdge, HotkeyListener};
+use splaude_core::{diagnostic, quota, Setting};
+use splaude_platform::{autostart, focus, submit, Capability, HotkeyEdge, HotkeyListener};
 use take::{Report, Take};
+
+/// Longest press that still counts as a tap rather than a hold.
+///
+/// This is the whole of the tap-versus-hold decision, so the number matters in
+/// both directions. Too low and a deliberate tap reads as a very short hold,
+/// which starts a take and ends it again before a word gets out. Too high and
+/// the shortest real dictations — "yes", "no", a name — end at the threshold
+/// instead of at the key, leaving the microphone latched open with the user
+/// convinced they stopped it.
+///
+/// 400 ms is `holdThreshold` from `Hotkey.swift`, which is the one version of
+/// this number that has shipped and been lived with. It also sits above the
+/// ~250 ms a comfortable double-tap runs at and below the ~500 ms a person
+/// needs to say anything at all, so neither gesture is near the edge.
+const TAP_CEILING: Duration = Duration::from_millis(400);
 
 /// How often the credential is re-read, matching the Swift build's timer.
 ///
@@ -39,7 +57,7 @@ USAGE:
     splaude [OPTION]
 
 OPTIONS:
-    (none)      Run. Hold the hotkey to dictate.
+    (none)      Run. Hold the hotkey to dictate, or tap it to latch on.
     --check     Report credential, permission and device state, then exit.
     --help      Show this message.
     --version   Show the version.
@@ -52,6 +70,10 @@ OPTIONS:
 /// these and let the loop, which owns the take, decide what it means.
 enum Wake {
     Hotkey(HotkeyEdge),
+    /// Return was pressed — but not by us — while a take was on the air. From
+    /// the hook in [`splaude_platform::submit`], which runs on this same
+    /// thread and so must do nothing heavier than post this.
+    Submit,
     #[cfg(not(target_os = "linux"))]
     Menu(tray::MenuId),
     /// A change of input level step, from the audio callback.
@@ -63,6 +85,97 @@ enum Wake {
     /// A credential re-read, from the polling thread.
     #[cfg(not(target_os = "linux"))]
     Health(Option<String>),
+}
+
+// MARK: - Take state
+
+/// How the take currently on the air is being kept there.
+///
+/// This is the overlap guard grown a second state rather than a flag beside it.
+/// It used to be `Option<Take>` alone, and "is a take running" was the only
+/// question the loop could ask; latching needs it to also answer "and does the
+/// next press start one or stop this one", which is not a property a second
+/// boolean can hold without the two disagreeing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Grip {
+    /// The key is still down and the take ends when it comes up. Carries when
+    /// it went down, which is the only thing separating a tap from a hold.
+    Held(Instant),
+    /// The key was tapped and let go. The take runs until the next press.
+    Latched,
+}
+
+/// What a hotkey edge means for the take the loop already has.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Act {
+    Start,
+    /// Leave the take running with the key up.
+    Latch,
+    Stop,
+    Ignore,
+}
+
+/// Decides what an edge means.
+///
+/// Pure over the grip and the clock, so tap-versus-hold is testable with no
+/// hotkey, no microphone and no desktop session — which is the only way it can
+/// be tested at all.
+///
+/// The two `Ignore`s are each load-bearing:
+///
+/// - **Pressed while held** is the original overlap guard. Holding a registered
+///   chord auto-repeats, and every repeat arrives as a fresh `Pressed`; opening
+///   a second socket for each of them is what this has always refused. It also
+///   keeps `Held`'s instant pinned to the *first* press, so a two-second hold
+///   is measured from where it started rather than from the last repeat.
+/// - **Released while latched** is the second half of a latching tap. The tap
+///   that stops a latched take arrives as `Pressed` and takes the take with it;
+///   its own release then finds nothing running, and must not be read as the
+///   end of a hold that never began.
+fn act(grip: Option<Grip>, edge: HotkeyEdge, now: Instant) -> Act {
+    match (grip, edge) {
+        (None, HotkeyEdge::Pressed) => Act::Start,
+        (None, HotkeyEdge::Released) => Act::Ignore,
+
+        (Some(Grip::Held(_)), HotkeyEdge::Pressed) => Act::Ignore,
+        (Some(Grip::Held(since)), HotkeyEdge::Released) => {
+            // Saturating: `Instant` is monotonic, but a press and its release
+            // can be delivered out of order across the message queue, and a
+            // negative duration would panic rather than merely be wrong.
+            if now.saturating_duration_since(since) < TAP_CEILING {
+                Act::Latch
+            } else {
+                Act::Stop
+            }
+        }
+
+        (Some(Grip::Latched), HotkeyEdge::Pressed) => Act::Stop,
+        (Some(Grip::Latched), HotkeyEdge::Released) => Act::Ignore,
+    }
+}
+
+/// The take on the air, and everything that has to die with it.
+struct Running {
+    take: Take,
+    grip: Grip,
+    /// The Return watcher, installed for the life of this take and no longer.
+    ///
+    /// A low-level keyboard hook sits in the OS's input path for every
+    /// keystroke on the desktop, so an idle splaude has no business holding
+    /// one. `None` where the setting is off, the binding collides, or the
+    /// platform has no watcher at all.
+    submit: Option<submit::Watch>,
+}
+
+impl Running {
+    fn finish(self) {
+        let Self { take, submit, .. } = self;
+        // Before the take, not after: `Take::finish` waits on the microphone
+        // and the socket, and the hook must not outlive the take it belongs to
+        // by however long that costs.
+        drop(submit);
+        take.finish();
+    }
 }
 
 fn main() -> Result<()> {
@@ -101,9 +214,17 @@ fn run() -> Result<()> {
     diagnostic::session("start");
 
     // `mut` only on the platforms that have a tray: the launch-at-login item
-    // is the one thing in the loop that writes a setting back.
+    // and Reload Settings are what write a setting back.
     #[cfg_attr(target_os = "linux", allow(unused_mut))]
-    let mut setting = Setting::load();
+    let (mut setting, note) = Setting::load_checked();
+    if let Some(line) = &note {
+        // Loud on the way past, because everything downstream is now running
+        // on defaults the user did not choose.
+        diagnostic::log(
+            "setting",
+            format!("{line} — using defaults ({})", Setting::path().display()),
+        );
+    }
     let store = Arc::new(credential_store());
     let capability = Capability::detect();
 
@@ -178,12 +299,24 @@ fn run() -> Result<()> {
         });
     }
 
+    // Settled here rather than per take, and re-settled by a reload rather than
+    // on every key-down: asking again per dictation would put the same line in
+    // the log once per take.
+    #[cfg_attr(target_os = "linux", allow(unused_mut))]
+    let mut stop_on_return = watching_return(&setting);
+
+    let submit_proxy = event_loop.create_proxy();
+
     println!("splaude is listening.");
-    println!("Hold {} to dictate. Ctrl+C to quit.", setting.hotkey);
+    println!(
+        "Hold {} to talk, or tap to latch it on. Ctrl+C to quit.",
+        setting.hotkey
+    );
 
     // One take at a time. A second key-down before the first take finished is
-    // the key repeating or a stuck modifier, not a request to open two sockets.
-    let mut take: Option<Take> = None;
+    // the key repeating or a stuck modifier, not a request to open two sockets
+    // — see `act`, which is where that rule now lives.
+    let mut take: Option<Running> = None;
     // Held in an `Option` only so `LoopDestroyed` can drop it: `run` never
     // returns, so the unregister has to happen inside the loop or not at all.
     let mut hotkey = Some(hotkey);
@@ -192,6 +325,12 @@ fn run() -> Result<()> {
     // the hotkey still works, there is just nothing to look at or quit from.
     #[cfg(not(target_os = "linux"))]
     let mut status: Option<tray::Tray> = None;
+    // Whether the file on disk failed to parse. While it did, nothing here
+    // writes over it: the broken text is the user's own edit, and saving
+    // defaults on top of it would destroy the keyterms and the binding they
+    // were trying to change — the exact loss this whole item exists to prevent.
+    #[cfg(not(target_os = "linux"))]
+    let mut file_broken = note.is_some();
 
     event_loop.run(move |event, _target, flow| {
         // Nothing here polls, so idling costs nothing — every edge arrives as a
@@ -209,46 +348,102 @@ fn run() -> Result<()> {
                     health.clone(),
                     setting.launch_at_login,
                 ) {
-                    Ok(built) => status = Some(built),
+                    Ok(mut built) => {
+                        // The complaint about the settings file, if there was
+                        // one, has to survive to the first menu the user opens
+                        // — the log line above is written before there is
+                        // anywhere to show it.
+                        built.set_note(note.clone());
+                        status = Some(built);
+                    }
                     Err(error) => eprintln!("splaude: {error:#}"),
                 }
             }
 
-            Event::UserEvent(Wake::Hotkey(HotkeyEdge::Pressed)) => {
-                if take.is_none() {
-                    #[cfg(not(target_os = "linux"))]
-                    let report = report(&level_proxy, &transcript_proxy);
-                    #[cfg(target_os = "linux")]
-                    let report = Report::silent();
+            Event::UserEvent(Wake::Hotkey(edge)) => {
+                let now = Instant::now();
+                match act(take.as_ref().map(|running| running.grip), edge, now) {
+                    Act::Start => {
+                        #[cfg(not(target_os = "linux"))]
+                        let report = report(&level_proxy, &transcript_proxy);
+                        #[cfg(target_os = "linux")]
+                        let report = Report::silent();
 
-                    match Take::start(
-                        runtime.handle(),
-                        Arc::clone(&store),
-                        &setting,
-                        injector.clone(),
-                        report,
-                    ) {
-                        Ok(started) => {
-                            take = Some(started);
-                            // Only once the take is actually live: an icon that
-                            // goes red on a take that failed to start is a lie.
-                            // Step zero — the meter starts empty and the first
-                            // audio buffer raises it.
-                            #[cfg(not(target_os = "linux"))]
-                            if let Some(shown) = status.as_mut() {
-                                shown.set_mood(tray::Mood::Recording(0));
+                        match Take::start(
+                            runtime.handle(),
+                            Arc::clone(&store),
+                            &setting,
+                            injector.clone(),
+                            report,
+                        ) {
+                            Ok(started) => {
+                                take = Some(Running {
+                                    take: started,
+                                    // Every take begins as a hold. A tap is not
+                                    // something that can be recognised at
+                                    // key-down — it is a hold that turned out
+                                    // to be short — so latching is decided at
+                                    // the release and never here.
+                                    grip: Grip::Held(now),
+                                    submit: watch_return(stop_on_return, &submit_proxy),
+                                });
+                                // Only once the take is actually live: an icon that
+                                // goes red on a take that failed to start is a lie.
+                                // Step zero — the meter starts empty and the first
+                                // audio buffer raises it.
+                                #[cfg(not(target_os = "linux"))]
+                                if let Some(shown) = status.as_mut() {
+                                    shown.set_mood(tray::Mood::Recording(0));
+                                }
+                            }
+                            Err(error) => {
+                                eprintln!("splaude: {error:#}");
+                                // The take may well have died on the credential, so
+                                // say so in the menu now rather than at the next
+                                // poll, five minutes from now.
+                                #[cfg(not(target_os = "linux"))]
+                                if let Some(shown) = status.as_mut() {
+                                    shown.set_health(store.health().headline());
+                                }
                             }
                         }
-                        Err(error) => {
-                            eprintln!("splaude: {error:#}");
-                            // The take may well have died on the credential, so
-                            // say so in the menu now rather than at the next
-                            // poll, five minutes from now.
-                            #[cfg(not(target_os = "linux"))]
-                            if let Some(shown) = status.as_mut() {
-                                shown.set_health(store.health().headline());
-                            }
+                    }
+
+                    // The key is up and the take stays on the air. Nothing to
+                    // tear down and nothing for the icon to say — it is already
+                    // red, and it is still recording.
+                    Act::Latch => {
+                        if let Some(running) = take.as_mut() {
+                            running.grip = Grip::Latched;
+                            diagnostic::log("take", "tapped — latched until the next press");
                         }
+                    }
+
+                    Act::Stop => {
+                        if let Some(running) = take.take() {
+                            running.finish();
+                        }
+                        #[cfg(not(target_os = "linux"))]
+                        if let Some(shown) = status.as_mut() {
+                            shown.set_mood(tray::Mood::Idle);
+                        }
+                    }
+
+                    Act::Ignore => {}
+                }
+            }
+
+            // Submitting is a statement that you are done talking. The
+            // keystroke itself was never consumed — see `splaude_platform
+            // ::submit` — so whatever the user pressed Return in has already
+            // sent; this only ends the dictation.
+            Event::UserEvent(Wake::Submit) => {
+                if let Some(running) = take.take() {
+                    diagnostic::log("submit", "Return pressed — ending the take");
+                    running.finish();
+                    #[cfg(not(target_os = "linux"))]
+                    if let Some(shown) = status.as_mut() {
+                        shown.set_mood(tray::Mood::Idle);
                     }
                 }
             }
@@ -278,16 +473,6 @@ fn run() -> Result<()> {
                     shown.set_health(headline);
                 }
             }
-            Event::UserEvent(Wake::Hotkey(HotkeyEdge::Released)) => {
-                if let Some(running) = take.take() {
-                    running.finish();
-                }
-                #[cfg(not(target_os = "linux"))]
-                if let Some(shown) = status.as_mut() {
-                    shown.set_mood(tray::Mood::Idle);
-                }
-            }
-
             // The only thing in the process that asks the loop to end, and so
             // the only reason `LoopDestroyed` below ever runs. Without it the
             // hotkey registration outlives the process's own shutdown path.
@@ -303,12 +488,49 @@ fn run() -> Result<()> {
 
                 tray::Ask::RevealLog => tray::reveal_log(),
 
+                // Deliberately not gated on whether a take is running: the
+                // whole point is to answer "do keystrokes from this app land
+                // anywhere" without speaking, so it has to work at rest.
+                tray::Ask::TestPaste => take::probe(setting.clone(), injector.clone()),
+
+                tray::Ask::EditSetting => tray::edit_setting(&setting),
+
+                // Refused mid-take rather than deferred. A deferred reload has
+                // to be remembered and then fired from wherever the take
+                // happens to end — release, latch-stop, Return, or Quit — and
+                // every one of those paths would have to be right for the
+                // hotkey not to move underneath a user who is still holding it.
+                // Refusing is one path, it is honest about what happened, and
+                // the recovery is to click the item again a second later.
+                tray::Ask::ReloadSetting => {
+                    if take.is_some() {
+                        diagnostic::log(
+                            "setting",
+                            "a take is on the air — not reloading; try again once it ends",
+                        );
+                    } else {
+                        file_broken = !reload(
+                            &mut setting,
+                            hotkey.as_mut(),
+                            &injector,
+                            &mut stop_on_return,
+                            status.as_mut(),
+                        );
+                    }
+                }
+
                 tray::Ask::ToggleAutostart => {
                     let want = !setting.launch_at_login;
                     match autostart::set(want) {
                         Ok(()) => {
                             setting.launch_at_login = want;
-                            if let Err(error) = setting.save() {
+                            if file_broken {
+                                diagnostic::log(
+                                    "setting",
+                                    "the file did not parse, so it is left exactly as written \
+                                     — launch at login is set on the machine only",
+                                );
+                            } else if let Err(error) = setting.save() {
                                 eprintln!("splaude: could not save the setting: {error}");
                             }
                         }
@@ -338,6 +560,170 @@ fn run() -> Result<()> {
             _ => {}
         }
     })
+}
+
+/// Whether a take should install the Return watcher at all.
+///
+/// Three inputs, and only one of them is the user's preference: the platform
+/// has to have a watcher, and the binding must not be Return itself.
+fn watching_return(setting: &Setting) -> bool {
+    if !setting.stop_on_return || !submit::is_supported() {
+        return false;
+    }
+
+    if submit::collides(setting.hotkey) {
+        // Not a failure — the watcher stands down and everything else works —
+        // but the user asked for a behaviour they are not getting, and a
+        // silently absent one is the thing this app logs against.
+        diagnostic::log(
+            "submit",
+            format!(
+                "{} is itself the key that ends a take, so Return cannot also stop one \
+                 while it is bound. Pick another hotkey, or turn stopOnReturn off.",
+                setting.hotkey
+            ),
+        );
+        return false;
+    }
+
+    true
+}
+
+/// Re-reads the settings file and applies what can be applied while running.
+///
+/// Called only with no take on the air; see the menu arm for why that is a
+/// refusal rather than a deferral.
+///
+/// Most of a [`Setting`] is read per take, so applying it is nothing more than
+/// replacing the value the loop holds. Two things are not: the hotkey is
+/// registered with the OS and has to be moved through the listener, and
+/// launch-at-login is a fact about the machine that the file is only the intent
+/// for — the same reconcile `run` does at startup.
+///
+/// Answers whether the file parsed, which is what decides if anything is
+/// allowed to write over it afterwards.
+#[cfg(not(target_os = "linux"))]
+#[must_use]
+fn reload(
+    setting: &mut Setting,
+    hotkey: Option<&mut HotkeyListener>,
+    injector: &Sender<inject::Command>,
+    stop_on_return: &mut bool,
+    mut status: Option<&mut tray::Tray>,
+) -> bool {
+    let (mut next, note) = Setting::load_checked();
+
+    if let Some(note) = note {
+        // The one place where falling back to defaults would be actively
+        // destructive: this process already holds a working setting, and
+        // replacing it over a mistyped comma is precisely the silent revert
+        // this item exists to make visible. Keep what is running.
+        diagnostic::log("setting", format!("{note} — keeping the settings in use"));
+        if let Some(shown) = status.as_mut() {
+            shown.set_note(Some(note));
+        }
+        return false;
+    }
+
+    if next.hotkey != setting.hotkey {
+        match hotkey {
+            Some(listener) => match listener.rebind(next.hotkey) {
+                Ok(()) => {
+                    diagnostic::log("setting", format!("hotkey is now {}", next.hotkey));
+                    // The injector has to hear about it too: it leaves the live
+                    // binding's modifier alone and clears every other one, so a
+                    // rebind it never saw would guard the wrong key.
+                    let _ = injector.send(inject::Command::Bind {
+                        binding: next.hotkey,
+                    });
+                }
+                Err(error) => {
+                    // `rebind` restores the previous registration on refusal,
+                    // so the user still has a working hotkey. What must not
+                    // happen is the in-memory setting drifting away from what
+                    // is actually registered — the injector and the Return
+                    // watcher both key off it.
+                    next.hotkey = listener.binding();
+                    diagnostic::log(
+                        "setting",
+                        format!("{error:#} — still bound to {}", next.hotkey),
+                    );
+                }
+            },
+            None => {
+                next.hotkey = setting.hotkey;
+                diagnostic::log("setting", "no hotkey listener — the binding is unchanged");
+            }
+        }
+    }
+
+    if next.launch_at_login != setting.launch_at_login {
+        if let Err(error) = autostart::set(next.launch_at_login) {
+            diagnostic::log(
+                "setting",
+                format!("could not reconcile launch at login: {error:#}"),
+            );
+            // Same rule as the hotkey: the value we keep is the one the machine
+            // actually has, not the one the file asked for.
+            next.launch_at_login = autostart::is_enabled();
+        }
+    }
+
+    let changed = setting.difference(&next);
+    *setting = next;
+    *stop_on_return = watching_return(setting);
+
+    if changed.is_empty() {
+        diagnostic::log("setting", "reloaded — nothing changed");
+    } else {
+        diagnostic::log("setting", format!("reloaded: {}", changed.join(", ")));
+    }
+
+    if let Some(shown) = status {
+        shown.set_note(None);
+        shown.set_hotkey(&setting.hotkey.to_string());
+        shown.set_autostart(autostart::is_enabled());
+        // Nothing above necessarily changed anything the menu draws, and a
+        // reload that leaves a stale menu behind is a reload the user cannot
+        // see happened.
+        shown.refresh();
+    }
+
+    true
+}
+
+/// Installs the Return watcher for one take, if this build is watching at all.
+///
+/// The hook goes in **on this thread** because that is where it has to live.
+/// `WH_KEYBOARD_LL` is delivered by posting to the message queue of the thread
+/// that installed it, so a hook installed anywhere without a pump is silently
+/// never called — and the only thread in this process guaranteed to be pumping
+/// is this one, the `tao` loop `global-hotkey` already requires. That is also
+/// why this is a free function called from inside the loop rather than
+/// something `Take::start` does: a take may not care which thread it is on,
+/// but this does.
+///
+/// The callback fires from inside the hook procedure, in the OS's input path
+/// for every keystroke on the desktop, so it does nothing but post — the same
+/// shape as the hotkey and tray callbacks, for a stricter version of the same
+/// reason.
+fn watch_return(watching: bool, proxy: &EventLoopProxy<Wake>) -> Option<submit::Watch> {
+    if !watching {
+        return None;
+    }
+
+    let proxy = proxy.clone();
+    match submit::watch(Box::new(move || {
+        let _ = proxy.send_event(Wake::Submit);
+    })) {
+        Ok(watch) => watch,
+        Err(error) => {
+            // A take with no watcher is a take that behaves the way it did
+            // before this existed, which is not worth refusing to record over.
+            diagnostic::log("submit", format!("{error:#}"));
+            None
+        }
+    }
 }
 
 /// The callbacks for one take, wired to the tray through the event loop.
@@ -399,8 +785,23 @@ fn check() -> Result<()> {
     }
     println!();
 
-    let setting = Setting::load();
+    // The claim this whole report exists to back up: dictation is not supposed
+    // to spend Claude quota, and the rate-limit headers on the speech socket's
+    // handshake are the only client-side evidence either way. This process has
+    // opened no socket, so the honest answer here is always that nobody has
+    // asked yet — which is why the never-dictated state is a distinct reading
+    // rather than a cheerful "none seen".
+    println!("quota");
+    println!("  rate limit  {}", quota::summary());
+    println!("  a handshake that answers with no anthropic-ratelimit header spent nothing");
+    println!();
+
+    let (setting, note) = Setting::load_checked();
     println!("setting");
+    if let Some(line) = &note {
+        println!("  {line}");
+        println!("  everything below is the default, not what the file says");
+    }
     println!("  hotkey    {}", setting.hotkey);
     println!("  language  {}", setting.language);
     println!("  live typing {}", mark(setting.live_typing));
@@ -435,5 +836,141 @@ fn mark(yes: bool) -> &'static str {
         "yes"
     } else {
         "no"
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    // Classification only. Nothing here starts a take, installs a hook, opens
+    // a device or synthesises a keystroke — `act` is pure precisely so the
+    // gesture that decides whether the microphone stays open can be checked
+    // with none of them.
+
+    /// A press that started `ago` in the past.
+    fn held(ago: Duration) -> (Option<Grip>, Instant) {
+        let now = Instant::now();
+        let since = now
+            .checked_sub(ago)
+            .expect("the monotonic clock should be older than the test");
+        (Some(Grip::Held(since)), now)
+    }
+
+    /// Comfortably inside the tap window, and comfortably outside it.
+    const BRIEF: Duration = Duration::from_millis(80);
+    const LONG: Duration = Duration::from_millis(2_000);
+
+    #[test]
+    fn a_press_with_no_take_starts_one() {
+        assert_eq!(act(None, HotkeyEdge::Pressed, Instant::now()), Act::Start);
+    }
+
+    #[test]
+    fn holding_and_letting_go_ends_the_take() {
+        // The original behaviour, and the one that must not have changed:
+        // push-to-talk is still push-to-talk.
+        let (grip, now) = held(LONG);
+        assert_eq!(act(grip, HotkeyEdge::Released, now), Act::Stop);
+    }
+
+    #[test]
+    fn tapping_latches_the_take_on() {
+        let (grip, now) = held(BRIEF);
+        assert_eq!(act(grip, HotkeyEdge::Released, now), Act::Latch);
+    }
+
+    #[test]
+    fn the_next_press_while_latched_stops_the_take() {
+        // The interaction that matters most: a second tap must end the take
+        // rather than try to open a second one alongside it.
+        assert_eq!(
+            act(Some(Grip::Latched), HotkeyEdge::Pressed, Instant::now()),
+            Act::Stop
+        );
+    }
+
+    #[test]
+    fn the_release_of_the_stopping_tap_does_nothing() {
+        // That press already took the take with it, so by the time its own
+        // release arrives there is nothing running — and a release with no take
+        // must never be read as the end of a hold.
+        assert_eq!(act(None, HotkeyEdge::Released, Instant::now()), Act::Ignore);
+    }
+
+    #[test]
+    fn a_repeat_while_held_does_not_open_a_second_take() {
+        // Holding a registered chord auto-repeats, and every repeat arrives as
+        // a fresh press. This is the overlap guard the loop has always had.
+        let (grip, now) = held(LONG);
+        assert_eq!(act(grip, HotkeyEdge::Pressed, now), Act::Ignore);
+    }
+
+    #[test]
+    fn a_repeat_does_not_reset_when_the_hold_began() {
+        // The corollary of the rule above: because the repeat is ignored, the
+        // grip keeps the *first* press's instant, so a long hold is still
+        // measured from where it started. If a repeat re-armed the timer, every
+        // hold would look like a tap and latch instead of ending.
+        let (grip, now) = held(LONG);
+        assert_eq!(act(grip, HotkeyEdge::Pressed, now), Act::Ignore);
+        assert_eq!(act(grip, HotkeyEdge::Released, now), Act::Stop);
+    }
+
+    #[test]
+    fn a_latched_take_ignores_a_release() {
+        assert_eq!(
+            act(Some(Grip::Latched), HotkeyEdge::Released, Instant::now()),
+            Act::Ignore
+        );
+    }
+
+    #[test]
+    fn the_threshold_is_the_only_thing_separating_the_two_gesture() {
+        // Either side of the line, to the millisecond. Exactly at the ceiling
+        // is a hold: a tap is a press *shorter* than the threshold, so the
+        // boundary belongs to the gesture that keeps the old behaviour.
+        let (just_under, now) = held(TAP_CEILING - Duration::from_millis(1));
+        assert_eq!(act(just_under, HotkeyEdge::Released, now), Act::Latch);
+
+        let (exactly, now) = held(TAP_CEILING);
+        assert_eq!(act(exactly, HotkeyEdge::Released, now), Act::Stop);
+
+        let (just_over, now) = held(TAP_CEILING + Duration::from_millis(1));
+        assert_eq!(act(just_over, HotkeyEdge::Released, now), Act::Stop);
+    }
+
+    #[test]
+    fn a_release_that_arrives_before_its_press_is_a_hold_not_a_panic() {
+        // Both edges cross a message queue, and nothing guarantees the clock
+        // read for one lands after the clock read for the other. Subtracting
+        // the wrong way round would panic in the middle of a take.
+        let now = Instant::now();
+        let future = now + Duration::from_secs(1);
+        assert_eq!(
+            act(Some(Grip::Held(future)), HotkeyEdge::Released, now),
+            Act::Latch
+        );
+    }
+
+    #[test]
+    fn the_tap_window_is_a_gesture_not_an_accident() {
+        // Guards the constant itself. Below a tenth of a second no human taps
+        // reliably; above a second the shortest real dictations would latch.
+        assert!(TAP_CEILING >= Duration::from_millis(100));
+        assert!(TAP_CEILING <= Duration::from_millis(1_000));
+    }
+
+    #[test]
+    fn every_edge_has_an_answer_in_every_grip() {
+        // The state machine is total: there is no combination of grip and edge
+        // that falls through to a default, because a missed one would leave the
+        // microphone open with no way to close it.
+        let now = Instant::now();
+        for grip in [None, Some(Grip::Held(now)), Some(Grip::Latched)] {
+            for edge in [HotkeyEdge::Pressed, HotkeyEdge::Released] {
+                let _ = act(grip, edge, now);
+            }
+        }
     }
 }

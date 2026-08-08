@@ -100,6 +100,17 @@ pub const AVAILABLE_LANGUAGE: [(&str, &str); 15] = [
 const TYPING_INTERVAL_FLOOR: u32 = 200;
 const TYPING_INTERVAL_CEILING: u32 = 8_000;
 
+/// A UTF-8 byte-order mark.
+///
+/// Hand-editing this file is a supported way to change a setting — that is the
+/// property the module header is about — so the file has to survive the editors
+/// people actually have. On Windows both Notepad and PowerShell's `Out-File
+/// -Encoding utf8` write these three bytes at the front, `serde_json` rejects
+/// them as "expected value at line 1 column 1", and the whole file used to
+/// revert to defaults over a mark the user cannot even see. Stripping it is not
+/// leniency about malformed JSON; the bytes after it are the document.
+const BOM: [u8; 3] = [0xEF, 0xBB, 0xBF];
+
 // MARK: - Hotkey
 
 /// A push-to-talk binding, in the W3C `KeyboardEvent.code` vocabulary.
@@ -412,6 +423,48 @@ impl Setting {
             .join("setting.json")
     }
 
+    /// Parses the bytes of a settings file, normalised.
+    ///
+    /// Pure over the bytes, so both the mark [`BOM`] describes and a genuine
+    /// typo can be exercised without a config directory.
+    pub fn parse(data: &[u8]) -> Result<Self, String> {
+        let body = data.strip_prefix(&BOM).unwrap_or(data);
+        let mut setting: Self = serde_json::from_slice(body).map_err(|error| format!("{error}"))?;
+        setting.normalise();
+        Ok(setting)
+    }
+
+    /// Reads the file, saying what is wrong with it rather than only logging.
+    ///
+    /// The second half of the pair is `None` when the file parsed, or when
+    /// there is no file at all — a first run is not a complaint. It is `Some`
+    /// exactly when a file exists and could not be read, which is the case that
+    /// used to be invisible: a mistyped comma cost the user their hotkey and
+    /// their keyterms, and the only evidence was a line in a log they had no
+    /// reason to open.
+    ///
+    /// The setting handed back in that case is still defaults, because at
+    /// startup there is nothing else to fall back to. A caller that already
+    /// holds a live setting — the reload in `splaude-app` — must keep its own
+    /// and act on the note instead. **Nothing here rewrites the file**: the
+    /// broken text is the user's edit, and it is what they need to see to fix
+    /// it.
+    pub fn load_checked() -> (Self, Option<String>) {
+        let Ok(data) = std::fs::read(Self::path()) else {
+            return (Self::default(), None);
+        };
+
+        match Self::parse(&data) {
+            Ok(setting) => (setting, None),
+            // Named by file rather than by full path: this sentence goes in a
+            // menu, and a menu is as wide as its widest item.
+            Err(error) => (
+                Self::default(),
+                Some(format!("setting.json is not valid JSON — {error}")),
+            ),
+        }
+    }
+
     /// Reads the file, falling back to defaults.
     ///
     /// A corrupt or partial file is not an error worth blocking startup for —
@@ -419,19 +472,69 @@ impl Setting {
     /// and yields defaults rather than leaving the user with no dictation and
     /// no way to fix it except deleting a file they cannot find.
     pub fn load() -> Self {
-        let path = Self::path();
-        let mut setting = match std::fs::read(&path) {
-            Ok(data) => serde_json::from_slice(&data).unwrap_or_else(|error| {
-                crate::diagnostic::log(
-                    "setting",
-                    format!("{} unreadable ({error}) — using defaults", path.display()),
-                );
-                Self::default()
-            }),
-            Err(_) => Self::default(),
-        };
-        setting.normalise();
+        let (setting, note) = Self::load_checked();
+        if let Some(note) = note {
+            crate::diagnostic::log(
+                "setting",
+                format!("{} — using defaults ({})", note, Self::path().display()),
+            );
+        }
         setting
+    }
+
+    /// The fields that differ, spelled as the file spells them.
+    ///
+    /// For the reload log. A reload that silently does nothing is
+    /// indistinguishable from a reload that did not happen, and naming the keys
+    /// in the file's own `camelCase` is what lets a user match the log line to
+    /// the line they edited.
+    pub fn difference(&self, other: &Self) -> Vec<String> {
+        let mut changed: Vec<String> = Vec::new();
+
+        for (name, differs) in [
+            ("customKeyterm", self.custom_keyterm != other.custom_keyterm),
+            (
+                "useBuiltinKeyterm",
+                self.use_builtin_keyterm != other.use_builtin_keyterm,
+            ),
+            ("language", self.language != other.language),
+            ("liveTyping", self.live_typing != other.live_typing),
+            (
+                "typingInterval",
+                self.typing_interval != other.typing_interval,
+            ),
+            ("guardFocus", self.guard_focus != other.guard_focus),
+            ("stopOnReturn", self.stop_on_return != other.stop_on_return),
+            (
+                "customKeycodeApp",
+                self.custom_keycode_app != other.custom_keycode_app,
+            ),
+            (
+                "useBuiltinKeycodeApp",
+                self.use_builtin_keycode_app != other.use_builtin_keycode_app,
+            ),
+            ("anchorInput", self.anchor_input != other.anchor_input),
+            (
+                "showFloatingButton",
+                self.show_floating_button != other.show_floating_button,
+            ),
+            (
+                "floatingButtonPoint",
+                self.floating_button_point != other.floating_button_point,
+            ),
+            ("playSound", self.play_sound != other.play_sound),
+            ("hotkey", self.hotkey != other.hotkey),
+            (
+                "launchAtLogin",
+                self.launch_at_login != other.launch_at_login,
+            ),
+        ] {
+            if differs {
+                changed.push(name.to_string());
+            }
+        }
+
+        changed
     }
 
     pub fn save(&self) -> std::io::Result<()> {
@@ -678,6 +781,96 @@ mod test {
             serde_json::from_str(r#"{"language":"fr","hotkey":"Ctrl+Nonsense"}"#).unwrap();
         assert_eq!(setting.language, "fr");
         assert_eq!(setting.hotkey, Hotkey::default());
+    }
+
+    #[test]
+    fn a_byte_order_mark_does_not_disable_the_file() {
+        // Notepad and `Out-File -Encoding utf8` both write one, and it used to
+        // take every setting in the file down with it — silently, because the
+        // mark is invisible in the editor that added it.
+        let body = br#"{"language":"ja","typingInterval":2000}"#;
+        let mut marked = BOM.to_vec();
+        marked.extend_from_slice(body);
+
+        let plain = Setting::parse(body).expect("plain JSON should parse");
+        let with_mark = Setting::parse(&marked).expect("a BOM should not disable the file");
+        assert_eq!(with_mark, plain);
+        assert_eq!(with_mark.language, "ja");
+        assert_eq!(with_mark.typing_interval, 2_000);
+    }
+
+    #[test]
+    fn only_a_leading_mark_is_stripped() {
+        // The mark is a prefix, not a character class. One in the middle of the
+        // document is still a syntax error, and pretending otherwise would be
+        // silently accepting a file we did not understand.
+        let mut trailing = br#"{"language":"ja"}"#.to_vec();
+        trailing.extend_from_slice(&BOM);
+        assert!(Setting::parse(&trailing).is_err());
+    }
+
+    #[test]
+    fn a_typo_is_reported_rather_than_swallowed() {
+        // The other half of the same complaint: losing a hotkey and a keyterm
+        // list to a missed comma must at least be visible.
+        let error = Setting::parse(br#"{"language":"ja" "liveTyping":false}"#)
+            .expect_err("a missing comma is not valid JSON");
+        assert!(error.contains("line 1"), "{error}");
+    }
+
+    #[test]
+    fn parsing_normalises_what_it_read() {
+        // `load` used to be the only place that normalised, so anything reading
+        // the bytes directly got an unclamped interval.
+        let setting = Setting::parse(br#"{"typingInterval":1}"#).unwrap();
+        assert_eq!(setting.typing_interval, TYPING_INTERVAL_FLOOR);
+    }
+
+    #[test]
+    fn an_unchanged_setting_has_no_difference() {
+        let setting = Setting::default();
+        assert!(setting.difference(&setting).is_empty());
+    }
+
+    #[test]
+    fn difference_names_every_field_the_file_spells() {
+        // One entry per field, or a reload would apply something it never
+        // mentioned. Compared against a value that differs in all of them.
+        let other = Setting {
+            custom_keyterm: vec!["splaude".into()],
+            use_builtin_keyterm: false,
+            language: "ja".into(),
+            live_typing: false,
+            typing_interval: 2_000,
+            guard_focus: false,
+            stop_on_return: false,
+            custom_keycode_app: vec!["Ericom.exe".into()],
+            use_builtin_keycode_app: false,
+            anchor_input: false,
+            show_floating_button: false,
+            floating_button_point: Some(Point { x: 1.0, y: 2.0 }),
+            play_sound: true,
+            hotkey: "Ctrl+Shift+KeyD".parse().unwrap(),
+            launch_at_login: true,
+        };
+
+        let named = Setting::default().difference(&other);
+        assert_eq!(
+            named.len(),
+            15,
+            "a field missing from difference is a field a reload changes in silence: {named:?}"
+        );
+        assert!(named.contains(&"hotkey".to_string()));
+        assert!(named.contains(&"typingInterval".to_string()));
+    }
+
+    #[test]
+    fn difference_names_only_what_changed() {
+        let other = Setting {
+            language: "fr".into(),
+            ..Setting::default()
+        };
+        assert_eq!(Setting::default().difference(&other), vec!["language"]);
     }
 
     #[test]

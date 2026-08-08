@@ -48,6 +48,31 @@ use enigo::{Direction, Enigo, Key, Keyboard, Settings};
 /// a sentence is a handful of events rather than a hundred.
 const CHUNK_CHAR: usize = 16;
 
+/// The `dwExtraInfo` word stamped on every synthetic event this app posts on
+/// Windows — `'SPLD'`, the same four bytes `Hotkey.swift` signs its Carbon
+/// registration with.
+///
+/// It exists for [`crate::submit`], which watches for Return and must never
+/// fire on splaude's own output. Matching on the virtual key alone is *not*
+/// enough here, and that is a fact about this exact `enigo` version rather than
+/// a hypothetical: `Keyboard::text` on Windows special-cases `'\n'` and posts a
+/// real `VK_RETURN` click for it before the unicode payload, so a transcript
+/// containing a newline would type a keystroke indistinguishable from the user
+/// pressing Return. macOS has no such hole — `LiveTyper` posts everything on
+/// virtual key 0 — which is why the Swift build can match on keycode alone and
+/// this one cannot.
+///
+/// `enigo`'s own default is [`enigo::EVENT_MARKER`], the number 100, which any
+/// other `enigo` application on the machine would also stamp; a value of our own
+/// means the watcher ignores *our* keystrokes and nobody else's.
+///
+/// Deliberately not `LLKHF_INJECTED`: that flag is set for every synthetic
+/// event on the desktop, so keying off it would also ignore the Return of
+/// someone driving their keyboard through PowerToys, AutoHotkey or an
+/// on-screen keyboard — a real user submitting, by any reasonable reading.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) const INJECTION_MARKER: usize = 0x5350_4C44;
+
 /// Modifiers that can promote a keystroke into a shortcut. Deliberately
 /// includes Shift and Meta, not just the word-delete pair: Shift+Backspace and
 /// Meta+Backspace are destructive in enough editors to be worth clearing too.
@@ -112,6 +137,10 @@ impl Injector {
             // LiveTyper.swift. Default is already true; pinned because the whole
             // correctness argument on macOS rests on it.
             independent_of_keyboard_state: true,
+            // Read only on Windows — the field is in the shared `Settings` on
+            // every platform, and setting it where nothing reads it is cheaper
+            // than a `cfg` around one line. See [`INJECTION_MARKER`].
+            windows_dw_extra_info: Some(INJECTION_MARKER),
             ..Settings::default()
         };
 

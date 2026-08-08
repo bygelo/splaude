@@ -7,6 +7,11 @@
 
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
+// Both belong to `probe`, which is gated with the tray it is reached from.
+#[cfg(not(target_os = "linux"))]
+use std::thread;
+#[cfg(not(target_os = "linux"))]
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use tokio::runtime::Handle;
@@ -17,13 +22,31 @@ use splaude_core::speech::{
     AnthropicSpeechBackend, Session, SpeechBackend, SpeechEvent, TranscriptBuffer,
 };
 use splaude_core::{diagnostic, Setting, Typer};
-use splaude_platform::{focus, Capture, FocusVerdict};
+use splaude_platform::{focus, tone, Capture, FocusVerdict, Tone};
 
 use crate::inject::Command;
+
+/// What [`probe`] types. Short, unmistakable in a log, and unmistakable on
+/// screen — someone running Test Paste needs to recognise what landed without
+/// wondering whether it was their own typing.
+#[cfg(not(target_os = "linux"))]
+const PROBE_TEXT: &str = "splaude test paste";
+
+/// How long [`probe`] waits before typing anything.
+///
+/// The menu item is clicked in a tray menu, which owns the keyboard focus while
+/// it is open. Typing immediately would send the characters into a closing menu
+/// rather than into the field the user is looking at. The same 0.6 s
+/// `AppDelegate.swift` waits, for the same reason.
+#[cfg(not(target_os = "linux"))]
+const PROBE_SETTLE: Duration = Duration::from_millis(600);
 
 pub struct Take {
     capture: Capture,
     session: Session,
+    /// Remembered from the setting at start, so [`Take::finish`] does not have
+    /// to be handed the whole setting again to know whether to sound.
+    play_sound: bool,
 }
 
 /// Where a take tells the interface what it is doing.
@@ -107,7 +130,18 @@ impl Take {
         )
         .context("could not open the microphone")?;
 
-        Ok(Self { capture, session })
+        // Last, so the cue never sounds for a take that failed to open. An
+        // acknowledgement the app did not earn is worse than no acknowledgement
+        // — the whole reason to have one is to know the microphone is live.
+        if setting.play_sound {
+            tone::play(Tone::Start);
+        }
+
+        Ok(Self {
+            capture,
+            session,
+            play_sound: setting.play_sound,
+        })
     }
 
     /// Ends the take. The socket is told to close rather than dropped, so the
@@ -118,7 +152,75 @@ impl Take {
             "take",
             format!("peak level {:.2}", self.capture.last_peak()),
         );
+        if self.play_sound {
+            tone::play(Tone::Stop);
+        }
         self.session.finish();
+    }
+}
+
+/// Types a known string into whatever has focus — injection alone, with no
+/// microphone, no socket and no credential involved.
+///
+/// Every failure in this app looks the same from outside ("nothing happened"),
+/// and injection is the part with the least verification behind it. This is how
+/// someone tells "the mic never opened" from "the socket failed" from "the
+/// keystrokes went nowhere", without speaking a word.
+///
+/// It is only worth that if it exercises what a take exercises, so it goes down
+/// the same route: [`is_keycode_app`] decides between typing and pasting exactly
+/// as a buffered take's delivery does, and the text travels the same
+/// [`crate::inject`] channel to the same injector on the same thread.
+///
+/// Runs on a thread of its own because of [`PROBE_SETTLE`] — the caller is the
+/// event loop, and sleeping there would freeze the tray menu mid-close.
+///
+/// Gated with the tray, which is its only entry point: a probe has to be
+/// reachable to be worth anything, and the Linux build has no menu to reach it
+/// from. Same `cfg` as `tray.rs` itself, for the same reason.
+#[cfg(not(target_os = "linux"))]
+pub fn probe(setting: Setting, injector: Sender<Command>) {
+    let spawned = thread::Builder::new()
+        .name("splaude-probe".into())
+        .spawn(move || {
+            thread::sleep(PROBE_SETTLE);
+
+            // Read after the wait, not before: the point of the wait is that
+            // focus has moved back out of the menu, so the question "which
+            // application is this going to" only has an answer afterwards.
+            let destination = focus::executable().unwrap_or_else(|| "unknown".to_string());
+            let interval_micros = setting.typing_interval;
+            let keycode_app = is_keycode_app(&setting);
+
+            diagnostic::log(
+                "test",
+                format!(
+                    "typing {PROBE_TEXT:?} into {destination} by {}",
+                    if keycode_app { "paste" } else { "keystroke" }
+                ),
+            );
+
+            let sent = injector.send(if keycode_app {
+                Command::Paste {
+                    text: PROBE_TEXT.to_string(),
+                    interval_micros,
+                }
+            } else {
+                Command::Type {
+                    text: PROBE_TEXT.to_string(),
+                    interval_micros,
+                }
+            });
+
+            // The injector thread is gone, which means the app is on its way
+            // out; say so rather than leave a probe that reported nothing.
+            if sent.is_err() {
+                diagnostic::log("test", "the injector is no longer running");
+            }
+        });
+
+    if let Err(error) = spawned {
+        diagnostic::log("test", format!("could not start the probe: {error}"));
     }
 }
 

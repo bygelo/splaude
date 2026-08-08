@@ -62,6 +62,24 @@ binding safely, and the reason is worth reading before you change it
 ([CHANGELOG](CHANGELOG.md)). `splaude.exe --check` reports credential,
 capability, quota and settings state without opening a window or a microphone.
 
+## Updating
+
+splaude tells you when a newer version exists. It asks GitHub's release API
+once when it starts, and again whenever you click the update item in the menu.
+That is the only request splaude makes that is not dictation, it carries no
+token and no identifier beyond a `splaude/<version>` user agent, and if it
+fails, it fails quietly and the app carries on.
+
+Installing the new version is manual: download it and replace the old one. On
+Windows, put it back at the same path — *Launch at login* registers the path it
+was started from, so a binary that moves stops starting.
+
+splaude will not update itself, and on macOS that is deliberate rather than
+pending. The build is ad-hoc signed, so its code identity changes with every
+release, and macOS keys Accessibility and Microphone grants to that identity —
+a Mac that replaced its own binary would silently lose permission to type or
+listen. This is also why a manual upgrade asks for Accessibility again.
+
 ## Requirement
 
 - macOS 14+ (Apple Silicon), or Windows 10+

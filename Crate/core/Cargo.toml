@@ -20,4 +20,20 @@ serde_json = "1.0.151"
 thiserror = "2.0.19"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
 tokio-tungstenite = { version = "0.29.0", features = ["rustls-tls-webpki-roots"] }
+# One HTTPS GET, for the update check. Blocking on purpose: it is a single
+# request with no streaming, and an async client would put a second HTTP stack
+# in the binary to save nothing.
+#
+# Chosen over `reqwest` for what it does *not* add. With these features it
+# resolves to the same `rustls` 0.23 and the same `ring` already here for the
+# speech socket — no second TLS implementation, and no `aws-lc-rs`. That last
+# part is not cosmetic: `rustls` refuses to pick a provider once more than one
+# is compiled in, and `speech::anthropic` installs `ring` as the process
+# default. A dependency that dragged a second provider in would turn a
+# handshake into a panic.
+#
+# `default-features = false` drops gzip, brotli, cookies and the charset
+# machinery. `rustls-webpki-roots` ships the root store rather than reading the
+# platform's, which is the same trade `tokio-tungstenite` already makes here.
+ureq = { version = "3.3.0", default-features = false, features = ["rustls", "rustls-webpki-roots"] }
 url = "2.5.8"

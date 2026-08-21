@@ -67,12 +67,29 @@ enum Setting {
     /// builtin list sits in the middle rather than at either end — see
     /// `Project.Harvest` for why.
     static var wireKeyterm: [String] {
-        let catalog = catalogPath.isEmpty ? nil : URL(fileURLWithPath: catalogPath)
-        let harvest = useProjectKeyterm
-            ? Project.cachedHarvest(catalog: catalog)
-            : Project.Harvest()
+        wireKeyterm(from: projectHarvest(Project.cachedHarvest))
+    }
 
-        return customKeyterm
+    /// The wire list computed synchronously, for `--check`.
+    ///
+    /// The live path reads a background-warmed cache so a take never waits; a
+    /// one-shot `--check` process has no warmed cache and would otherwise report
+    /// the builtin list alone, which is exactly the opposite of what a diagnostic
+    /// meant to show the harvested bias should print.
+    static var wireKeytermSync: [String] {
+        wireKeyterm(from: projectHarvest(Project.harvest))
+    }
+
+    private static func projectHarvest(
+        _ source: (URL?) -> Project.Harvest
+    ) -> Project.Harvest {
+        guard useProjectKeyterm else { return Project.Harvest() }
+        let catalog = catalogPath.isEmpty ? nil : URL(fileURLWithPath: catalogPath)
+        return source(catalog)
+    }
+
+    private static func wireKeyterm(from harvest: Project.Harvest) -> [String] {
+        customKeyterm
             + harvest.identity
             + (useBuiltinKeyterm ? builtinKeyterm : [])
             + harvest.house

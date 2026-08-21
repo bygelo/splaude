@@ -6,8 +6,35 @@ Notable changes to splaude. Format follows
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-08-21
+
 ### Fixed
 
+- **The project harvest hung the take by several seconds.** Resolving the
+  active project read every Claude Code session log whole — 3200+ files, 2.5 GB
+  here — to pull a `cwd` from line five, synchronously on the hotkey path, so
+  the microphone did not open for whole seconds after the keypress. Three fixes:
+  the harvest now runs on a background queue and a take reads the last cached
+  result instantly (warmed at launch, refreshed every five minutes, never
+  computed inline); recency is ranked by project-*directory* mtime, one `stat`
+  each, instead of by per-file mtime across thousands of files; and `cwd` is
+  read from a bounded 64 KB prefix rather than the whole transcript. Cold first
+  scan is ~11 s of background work at launch; every take after is instant.
+- **A harvest past 93 terms silenced dictation entirely.** The endpoint answers
+  a take carrying more than 93 keyterms with `TranscriptError` and drops the
+  socket — not a truncated bias, no text at all. Both builds now cap at 64
+  terms alongside the existing 1024-character budget — synthetic speech tripped
+  the limit at 94 and live takes at 90, so the ceiling sits clear of both. Found by bisecting
+  against the live endpoint with `--bench --say`; only the byte budget was
+  bounded before, and the new project harvest routinely produces 145 terms.
+- **Keyterms are sent in the `x-config-keyterms` header only.** The 2.1.98
+  extension bundle appends one `keyterms` query parameter per term and sends no
+  such header, so splaude briefly sent both to cover either. Measurement says
+  that was backwards: a take carrying `keyterms` parameters fails with
+  `TranscriptError` whether or not the header rides along, while the header
+  alone transcribes and measurably biases the result. Whatever the extension
+  talks to, it is not what this credential reaches. The header splaude has
+  always sent was working; an earlier line here claiming otherwise was wrong.
 - The test suite no longer writes into the real log. Opening the log file used
   to be automatic, so anything that linked `splaude-core` and logged a line
   appended to `splaude.log` — including every test, run in parallel by cargo,
@@ -26,30 +53,6 @@ Notable changes to splaude. Format follows
   like from outside was the whole failure mode this log exists to prevent: no
   icon, a hotkey that does nothing, and a log holding a `start` line with
   nothing after it. Found in a real log, not in the suite.
-
-### Added
-
-- splaude says when a newer version has been published. It asks GitHub once at
-  startup and whenever the menu item is clicked, and the item does double duty:
-  an update that exists opens the release page, anything else goes and looks
-  again. Reported in `--check` too, which is the only part of that report that
-  reaches the network.
-- An available update is promoted to the top of the menu, beside the credential
-  warning, and only when there is one. "You are up to date" is an answer to a
-  question, not news, so it stays in the diagnostics group below.
-- `SPLAUDE_LOG` overrides where the log is written — a full file path, for a
-  portable install that wants its log beside the binary, or a machine where the
-  usual location is not writable.
-
-It checks and reports; it does not download, replace or restart anything. That
-is a stopping point rather than an unfinished feature, and macOS is the reason:
-this build is ad-hoc signed, so its code identity changes every release, and
-macOS keys Accessibility and Microphone grants to that identity. A Mac that
-updated itself would silently lose permission to do the only thing it exists to
-do. Self-installation is tractable on Windows and Linux and is worth doing
-there — behind a signature, not a bare download — but it is a separate change.
-
-## [0.2.0] — 2026-08-08
 
 ### Added
 
@@ -84,6 +87,29 @@ there — behind a signature, not a bare download — but it is a separate chang
   said the second time. `--say` renders the phrase with the system voice for a
   repeatable, microphone-free check of a harvester change. Measured 14/21
   target words recovered with the bias against 11/21 without.
+- splaude says when a newer version has been published. It asks GitHub once at
+  startup and whenever the menu item is clicked, and the item does double duty:
+  an update that exists opens the release page, anything else goes and looks
+  again. Reported in `--check` too, which is the only part of that report that
+  reaches the network.
+- An available update is promoted to the top of the menu, beside the credential
+  warning, and only when there is one. "You are up to date" is an answer to a
+  question, not news, so it stays in the diagnostics group below.
+- `SPLAUDE_LOG` overrides where the log is written — a full file path, for a
+  portable install that wants its log beside the binary, or a machine where the
+  usual location is not writable.
+
+It checks and reports; it does not download, replace or restart anything. That
+is a stopping point rather than an unfinished feature, and macOS is the reason:
+this build is ad-hoc signed, so its code identity changes every release, and
+macOS keys Accessibility and Microphone grants to that identity. A Mac that
+updated itself would silently lose permission to do the only thing it exists to
+do. Self-installation is tractable on Windows and Linux and is worth doing
+there — behind a signature, not a bare download — but it is a separate change.
+
+## [0.2.0] — 2026-08-08
+
+### Added
 
 - Warn about the credential before a take fails on it. splaude reads the Claude
   Code OAuth token but never refreshes it, so an install that is never opened
@@ -199,31 +225,6 @@ there — behind a signature, not a bare download — but it is a separate chang
   reload refuses outright and keeps what is already running, and toggling
   launch-at-login no longer saves defaults over a file it could not read, which
   would have destroyed a keyterm list as a side effect of clicking a checkbox.
-- **The project harvest hung the take by several seconds.** Resolving the
-  active project read every Claude Code session log whole — 3200+ files, 2.5 GB
-  here — to pull a `cwd` from line five, synchronously on the hotkey path, so
-  the microphone did not open for whole seconds after the keypress. Three fixes:
-  the harvest now runs on a background queue and a take reads the last cached
-  result instantly (warmed at launch, refreshed every five minutes, never
-  computed inline); recency is ranked by project-*directory* mtime, one `stat`
-  each, instead of by per-file mtime across thousands of files; and `cwd` is
-  read from a bounded 64 KB prefix rather than the whole transcript. Cold first
-  scan is ~11 s of background work at launch; every take after is instant.
-- **A harvest past 93 terms silenced dictation entirely.** The endpoint answers
-  a take carrying more than 93 keyterms with `TranscriptError` and drops the
-  socket — not a truncated bias, no text at all. Both builds now cap at 64
-  terms alongside the existing 1024-character budget — synthetic speech tripped
-  the limit at 94 and live takes at 90, so the ceiling sits clear of both. Found by bisecting
-  against the live endpoint with `--bench --say`; only the byte budget was
-  bounded before, and the new project harvest routinely produces 145 terms.
-- **Keyterms are sent in the `x-config-keyterms` header only.** The 2.1.98
-  extension bundle appends one `keyterms` query parameter per term and sends no
-  such header, so splaude briefly sent both to cover either. Measurement says
-  that was backwards: a take carrying `keyterms` parameters fails with
-  `TranscriptError` whether or not the header rides along, while the header
-  alone transcribes and measurably biases the result. Whatever the extension
-  talks to, it is not what this credential reaches. The header splaude has
-  always sent was working; an earlier line here claiming otherwise was wrong.
 
 - The Rust speech backend built its upgrade request by hand, which skipped
   `Sec-WebSocket-Key`, `Upgrade` and `Connection`, so every connection would

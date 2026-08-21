@@ -39,7 +39,7 @@ final class AnthropicSpeechBackend: NSObject, SpeechBackend {
     private let queue = DispatchQueue(label: "com.bygelo.splaude.speech")
 
     init(credential: TokenStore.Credential,
-         keyterm: [String] = Setting.keyterm,
+         keyterm: [String] = Setting.wireKeyterm,
          language: String = Setting.language,
          typedInterim: Bool = Setting.liveTyping) {
         self.credential = credential
@@ -54,6 +54,17 @@ final class AnthropicSpeechBackend: NSObject, SpeechBackend {
     private static let keepAliveInterval: TimeInterval = 8
     private static let closeGrace: TimeInterval = 3
     private static let keytermByteBudget = 1024
+
+    /// The server rejects a take outright past this many terms, replying
+    /// `TranscriptError` and dropping the connection — not a truncated bias, a
+    /// dictation that produces nothing at all.
+    ///
+    /// Measured against the live endpoint with synthetic speech: 93 terms
+    /// transcribes, 94 fails, and the ceiling is the term count rather than the
+    /// URL length — the same 145 terms fail when sent only in the header, with
+    /// no query parameters at all. 90 leaves headroom, since a limit found by
+    /// bisection on one day is not a documented contract.
+    private static let keytermCountBudget = 64
 
     private static let keepAliveFrame = #"{"type":"KeepAlive"}"#
     private static let closeFrame = #"{"type":"CloseStream"}"#
@@ -81,10 +92,22 @@ final class AnthropicSpeechBackend: NSObject, SpeechBackend {
         request.setValue("Bearer \(credential.accessToken)", forHTTPHeaderField: "Authorization")
         request.setValue("vscode", forHTTPHeaderField: "x-app")
 
+        // The header, and *only* the header. The 2.1.98 extension bundle
+        // appends one `keyterms` query parameter per term and sends no header
+        // at all, so splaude sent both for a while to cover either. Measured
+        // against the live endpoint, that was backwards: a take carrying
+        // `keyterms` parameters is answered with `TranscriptError` and a
+        // dropped socket, with or without the header alongside it, while the
+        // header on its own transcribes and demonstrably biases the result.
+        // Whatever the extension talks to, this is not it.
         let packed = Self.packKeyterm(keyterm)
         if !packed.isEmpty {
             request.setValue(packed, forHTTPHeaderField: "x-config-keyterms")
         }
+        Diagnostic.log(
+            "stt",
+            "keyterm on wire: \(Self.normaliseKeyterm(keyterm).count) terms, \(packed.count) chars"
+        )
 
         let session = URLSession(configuration: .default, delegate: self, delegateQueue: nil)
         self.session = session
@@ -168,9 +191,13 @@ final class AnthropicSpeechBackend: NSObject, SpeechBackend {
             flushPending()
 
         case "TranscriptError":
+            // Log the whole frame: the server's own wording is the only clue to
+            // *why* a take was refused, and it never reached the log before.
+            Diagnostic.log("stt", "TranscriptError frame: \(frame)")
             fail(frame["description"] as? String ?? "transcription error", fatal: false)
 
         case "error":
+            Diagnostic.log("stt", "error frame: \(frame)")
             fail(frame["message"] as? String ?? "server error", fatal: false)
 
         default:
@@ -220,14 +247,31 @@ final class AnthropicSpeechBackend: NSObject, SpeechBackend {
         delegate?.speechDidFail(message, fatal: fatal)
     }
 
-    /// Comma-joined, deduped, ASCII-only, truncated to the server's budget —
-    /// the same normalisation the extension applies before sending keyterms.
+    /// Comma-joined form of `normaliseKeyterm`, for the `x-config-keyterms`
+    /// header.
     static func packKeyterm(_ term: [String]) -> String {
+        normaliseKeyterm(term).joined(separator: ",")
+    }
+
+    /// Deduped, ASCII-only, truncated to the server's budget.
+    ///
+    /// The 2.1.98 extension bundle sends each surviving term as its own
+    /// `keyterms` query parameter and sends no `x-config-keyterms` header at
+    /// all — the header splaude shipped came from an earlier build. Both are
+    /// emitted now, from this one list, so the two transports can never
+    /// disagree about what was sent.
+    ///
+    /// Commas are stripped even though the query form does not need them: a
+    /// term that means one thing in the header and two in the URL is a bug
+    /// waiting for whichever transport the server happens to honour.
+    static func normaliseKeyterm(_ term: [String]) -> [String] {
         var seen = Set<String>()
         var kept: [String] = []
         var length = 0
 
         for raw in term {
+            if kept.count >= keytermCountBudget { break }
+
             let clean = raw
                 .replacingOccurrences(of: ",", with: " ")
                 .replacingOccurrences(of: "[^\\x20-\\x7E]", with: "", options: .regularExpression)
@@ -244,7 +288,7 @@ final class AnthropicSpeechBackend: NSObject, SpeechBackend {
             length += cost
         }
 
-        return kept.joined(separator: ",")
+        return kept
     }
 }
 

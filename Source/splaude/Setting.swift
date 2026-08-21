@@ -37,9 +37,46 @@ enum Setting {
         set { write(newValue, "useBuiltinKeyterm") }
     }
 
-    /// What actually goes on the wire.
+    /// Bias the recogniser with the project Claude Code was last used in, the
+    /// repos worked in recently, and the machine's own catalog.
+    ///
+    /// The IDE extension does this from its own workspace; splaude has none, so
+    /// it infers one. See `Project` for what is read and why.
+    static var useProjectKeyterm: Bool {
+        get { store.object(forKey: "useProjectKeyterm") as? Bool ?? true }
+        set { write(newValue, "useProjectKeyterm") }
+    }
+
+    /// A JSON inventory of this machine's infrastructure, harvested for the
+    /// proper nouns in it. Empty probes the locations splaude already knows.
+    static var catalogPath: String {
+        get { store.string(forKey: "catalogPath") ?? "" }
+        set { write(newValue, "catalogPath") }
+    }
+
+    /// The configured terms alone — builtin plus custom, no filesystem read.
     static var keyterm: [String] {
         (useBuiltinKeyterm ? builtinKeyterm : []) + customKeyterm
+    }
+
+    /// What actually goes on the wire, project bias interleaved.
+    ///
+    /// Packing truncates at the wire budget rather than sampling, so this order
+    /// *is* the priority. Terms the user typed lead: they were added because
+    /// something was being misheard, and nothing harvested outranks that. The
+    /// builtin list sits in the middle rather than at either end — see
+    /// `Project.Harvest` for why.
+    static var wireKeyterm: [String] {
+        let catalog = catalogPath.isEmpty ? nil : URL(fileURLWithPath: catalogPath)
+        let harvest = useProjectKeyterm
+            ? Project.cachedHarvest(catalog: catalog)
+            : Project.Harvest()
+
+        return customKeyterm
+            + harvest.identity
+            + (useBuiltinKeyterm ? builtinKeyterm : [])
+            + harvest.house
+            + harvest.vocabulary
     }
 
     static var language: String {

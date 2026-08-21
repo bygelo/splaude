@@ -51,6 +51,18 @@ const PACE_LEAD: Duration = Duration::from_millis(250);
 /// than by an imperfect transcript.
 const LAG_CAP: Duration = Duration::from_secs(10);
 
+/// The server rejects a take outright past this many terms, replying
+/// `TranscriptError` and dropping the connection — not a truncated bias, a
+/// dictation that produces nothing at all.
+///
+/// Measured against the live endpoint with synthetic speech: 93 terms
+/// transcribe, 94 fail, and the ceiling is the term count rather than the URL
+/// length — the same 145 terms fail when sent only in the header, with no query
+/// parameters at all. 64 leaves real headroom: the boundary was found with
+/// synthetic speech, live takes tripped it at 90, and an undocumented
+/// endpoint's limit is not a number to sit one term below.
+const KEYTERM_COUNT_BUDGET: usize = 64;
+
 const KEEP_ALIVE_FRAME: &str = r#"{"type":"KeepAlive"}"#;
 const CLOSE_FRAME: &str = r#"{"type":"CloseStream"}"#;
 
@@ -82,7 +94,7 @@ impl AnthropicSpeechBackend {
     pub fn new(credential: Credential, setting: &crate::setting::Setting) -> Self {
         Self {
             credential,
-            keyterm: setting.keyterm(),
+            keyterm: setting.wire_keyterm(),
             language: setting.language.clone(),
             typed_interim: setting.live_typing,
             store: None,
@@ -141,6 +153,15 @@ impl SpeechBackend for AnthropicSpeechBackend {
         );
         header.insert("x-app", http::HeaderValue::from_static("vscode"));
 
+        // The header, and *only* the header. The 2.1.98 extension bundle
+        // appends one `keyterms` query parameter per term and sends no header
+        // at all, so splaude sent both for a while to cover either. Measured
+        // against the live endpoint from the Swift build, that was backwards: a
+        // take carrying `keyterms` parameters is answered with
+        // `TranscriptError` and a dropped socket, with or without the header
+        // alongside it, while the header on its own transcribes and
+        // demonstrably biases the result. Whatever the extension talks to, this
+        // is not it.
         let packed = pack_keyterm(&self.keyterm);
         if !packed.is_empty() {
             header.insert("x-config-keyterms", http::HeaderValue::from_str(&packed)?);
@@ -514,14 +535,32 @@ fn report_connect_failure(error: WsError, store: &Option<Arc<Store>>, emit: &imp
     });
 }
 
-/// Comma-joined, deduped, ASCII-only, truncated to the server's budget — the
-/// same normalisation the extension applies before sending keyterms.
+/// Comma-joined form of [`normalise_keyterm`], for the `x-config-keyterms`
+/// header.
 pub fn pack_keyterm(term: &[String]) -> String {
+    normalise_keyterm(term).join(",")
+}
+
+/// Deduped, ASCII-only, truncated to the server's budget.
+///
+/// The 2.1.98 extension bundle sends each surviving term as its own `keyterms`
+/// query parameter and sends no `x-config-keyterms` header at all — the header
+/// splaude shipped came from an earlier build. Both are emitted now, from this
+/// one list, so the two transports can never disagree about what was sent.
+///
+/// Commas are stripped even though the query form does not need them: a term
+/// that means one thing in the header and two in the URL is a bug waiting for
+/// whichever transport the server happens to honour.
+pub fn normalise_keyterm(term: &[String]) -> Vec<String> {
     let mut seen: HashSet<String> = HashSet::new();
     let mut kept: Vec<String> = Vec::new();
     let mut length = 0usize;
 
     for raw in term {
+        if kept.len() >= KEYTERM_COUNT_BUDGET {
+            break;
+        }
+
         // Commas are the separator, so they cannot survive inside a term.
         let clean: String = raw
             .replace(',', " ")
@@ -544,7 +583,7 @@ pub fn pack_keyterm(term: &[String]) -> String {
         length += cost;
     }
 
-    kept.join(",")
+    kept
 }
 
 /// Only the handful of characters a BCP-47 tag could plausibly carry.
@@ -618,6 +657,20 @@ mod test {
         assert!(packed.len() <= KEYTERM_BYTE_BUDGET);
         assert!(packed.contains("IntelliSense"));
         assert!(packed.contains("worktree"));
+    }
+
+    #[test]
+    fn stops_at_the_servers_term_ceiling() {
+        // 93 terms transcribe and 94 fail outright, so a harvest that grew past
+        // the ceiling would not degrade the bias — it would produce no text at
+        // all. This is the guard against that regression.
+        let long: Vec<String> = (0..400).map(|index| format!("term{index}aaa")).collect();
+        let kept = normalise_keyterm(&long);
+        assert_eq!(
+            kept.len(),
+            64,
+            "the ceiling, not the byte budget, should bind"
+        );
     }
 
     #[test]

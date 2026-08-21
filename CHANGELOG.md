@@ -53,6 +53,38 @@ there — behind a signature, not a bare download — but it is a separate chang
 
 ### Added
 
+- **Project-aware recogniser bias**, in both the Swift and the Rust build. The IDE extension seeds
+  its recogniser with the workspace it is open in; splaude has no workspace, so
+  it infers one from the newest session log under `~/.claude/projects` — the
+  `cwd` field inside the file, not the directory name, which encodes `/`, `.`
+  and `_` all as `-` and cannot be inverted. From that directory it harvests the
+  project name, the branch words in `.git/HEAD`, the crate or package name, the
+  top-level directory names, and the identifiers the README puts in backticks.
+  Nothing to configure: the terms change when you change repo or branch. Visible
+  in the tray and in `--check`, and switchable off there.
+- **House and catalog bias.** The words a dictation gets wrong are rarely inside
+  the file you have open, so two sources rank above the current project's own
+  README vocabulary: the twenty most recently worked-in projects, taken from the
+  same session scan that already ran, and a JSON catalog of the machine's
+  infrastructure. `catalog_path` names any inventory file; splaude walks it and
+  keeps the values under name-like keys (`name`, `project`, `host`, `slug`,
+  `host_code`, `alias`), skipping objects with a `pid` because a running
+  process's name is an OS artefact and not a word anyone says. Unset, it probes
+  `~/.booted/inventory.json`. A file, not the endpoint that serves the same
+  data: a file read cannot hang on the hotkey path, and splaude has no business
+  shipping an HTTP client that talks to whatever a setting points at.
+- Tier ordering, because packing truncates at the wire budget rather than
+  sampling. Custom terms lead — they were typed because something was being
+  misheard. Then the project's identity, then the builtin developer list, then
+  the house (capped at half the budget so a machine with two hundred catalog
+  entries cannot evict `TypeScript`), then the current README's identifiers.
+- **`splaude --bench`** — a keyterm A/B that records a phrase once and replays
+  the identical audio down two sockets, one biased and one not, so the only
+  difference between the transcripts is the bias rather than how the phrase was
+  said the second time. `--say` renders the phrase with the system voice for a
+  repeatable, microphone-free check of a harvester change. Measured 14/21
+  target words recovered with the bias against 11/21 without.
+
 - Warn about the credential before a take fails on it. splaude reads the Claude
   Code OAuth token but never refreshes it, so an install that is never opened
   alongside `claude` eventually finds it dead. The menu now warns within ten
@@ -167,6 +199,31 @@ there — behind a signature, not a bare download — but it is a separate chang
   reload refuses outright and keeps what is already running, and toggling
   launch-at-login no longer saves defaults over a file it could not read, which
   would have destroyed a keyterm list as a side effect of clicking a checkbox.
+- **The project harvest hung the take by several seconds.** Resolving the
+  active project read every Claude Code session log whole — 3200+ files, 2.5 GB
+  here — to pull a `cwd` from line five, synchronously on the hotkey path, so
+  the microphone did not open for whole seconds after the keypress. Three fixes:
+  the harvest now runs on a background queue and a take reads the last cached
+  result instantly (warmed at launch, refreshed every five minutes, never
+  computed inline); recency is ranked by project-*directory* mtime, one `stat`
+  each, instead of by per-file mtime across thousands of files; and `cwd` is
+  read from a bounded 64 KB prefix rather than the whole transcript. Cold first
+  scan is ~11 s of background work at launch; every take after is instant.
+- **A harvest past 93 terms silenced dictation entirely.** The endpoint answers
+  a take carrying more than 93 keyterms with `TranscriptError` and drops the
+  socket — not a truncated bias, no text at all. Both builds now cap at 64
+  terms alongside the existing 1024-character budget — synthetic speech tripped
+  the limit at 94 and live takes at 90, so the ceiling sits clear of both. Found by bisecting
+  against the live endpoint with `--bench --say`; only the byte budget was
+  bounded before, and the new project harvest routinely produces 145 terms.
+- **Keyterms are sent in the `x-config-keyterms` header only.** The 2.1.98
+  extension bundle appends one `keyterms` query parameter per term and sends no
+  such header, so splaude briefly sent both to cover either. Measurement says
+  that was backwards: a take carrying `keyterms` parameters fails with
+  `TranscriptError` whether or not the header rides along, while the header
+  alone transcribes and measurably biases the result. Whatever the extension
+  talks to, it is not what this credential reaches. The header splaude has
+  always sent was working; an earlier line here claiming otherwise was wrong.
 
 - The Rust speech backend built its upgrade request by hand, which skipped
   `Sec-WebSocket-Key`, `Upgrade` and `Connection`, so every connection would

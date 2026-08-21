@@ -42,8 +42,8 @@ winresource = "0.1.31"
 
 [dependencies]
 anyhow = "1.0.104"
-splaude-core = { version = "0.2.0", path = "../core" }
-splaude-platform = { version = "0.2.0", path = "../platform" }
+splaude-core = { version = "0.3.0", path = "../core" }
+splaude-platform = { version = "0.3.0", path = "../platform" }
 tao = "0.36.0"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 

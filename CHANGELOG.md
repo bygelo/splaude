@@ -6,6 +6,24 @@ Notable changes to splaude. Format follows
 
 ## [Unreleased]
 
+## [0.3.2] — 2026-08-21
+
+### Fixed
+
+- The Keychain password prompt no longer appears on its own. Credential health
+  is shown on a five-minute timer that runs whether or not you are dictating,
+  and it read the token by going to the Keychain — an ACL decision macOS answers
+  with a login-password dialog whenever the "Always Allow" grant does not apply,
+  which is exactly the case the moment the token passes expiry and Claude Code
+  has rewritten the item with a fresh one. So the dialog surfaced spontaneously,
+  every few minutes around each token refresh, with no take in sight. Health now
+  classifies the already-cached token and never reads on a timer; the Keychain
+  is read only by an actual take, which is the only thing that needs a live
+  token. Fixed in both builds. (A rebuild still invalidates "Always Allow"
+  because an ad-hoc signature's code hash changes every build — that part is
+  inherent to shipping unnotarized.)
+
+
 ## [0.3.1] — 2026-08-21
 
 ### Fixed

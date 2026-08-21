@@ -32,7 +32,7 @@ if CommandLine.arguments.contains("--check") {
     let catalog = Project.catalogKeyterm(catalogPath.isEmpty ? nil : URL(fileURLWithPath: catalogPath))
     print("  catalog   \(catalog.isEmpty ? "none found" : "\(catalog.count) name")")
     print("  recent    \(Project.recentName(8).joined(separator: ", "))")
-    let packed = AnthropicSpeechBackend.packKeyterm(Setting.wireKeyterm)
+    let packed = AnthropicSpeechBackend.packKeyterm(Setting.wireKeytermSync)
     print("  budget    \(packed.count) of 1024 characters")
     print("  keyterm   \(packed)")
 

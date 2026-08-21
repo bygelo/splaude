@@ -2152,7 +2152,7 @@ dependencies = [
 
 [[package]]
 name = "splaude-app"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "arboard",
@@ -2166,7 +2166,7 @@ dependencies = [
 
 [[package]]
 name = "splaude-core"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2186,7 +2186,7 @@ dependencies = [
 
 [[package]]
 name = "splaude-platform"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "arboard",

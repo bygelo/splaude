@@ -949,7 +949,7 @@ fn check() -> Result<()> {
         "  recent    {}",
         splaude_core::project::recent_name(8).join(", ")
     );
-    let packed = splaude_core::speech::anthropic::pack_keyterm(&setting.wire_keyterm());
+    let packed = splaude_core::speech::anthropic::pack_keyterm(&setting.wire_keyterm_sync());
     println!("  budget    {} of 1024 characters", packed.len());
     println!("  keyterm   {packed}");
 

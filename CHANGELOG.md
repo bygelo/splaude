@@ -6,6 +6,18 @@ Notable changes to splaude. Format follows
 
 ## [Unreleased]
 
+## [0.3.1] — 2026-08-21
+
+### Fixed
+
+- `--check` reported the builtin list alone, not the project bias. It reads the
+  same wire list a take does, and that list now comes from a background-warmed
+  cache which a one-shot `--check` process has not had time to fill — so the one
+  diagnostic meant to show the harvested terms showed none of them. It now
+  harvests synchronously, which a short-lived report can afford and a take
+  cannot. The live dictation path is unchanged.
+
+
 ## [0.3.0] — 2026-08-21
 
 ### Fixed

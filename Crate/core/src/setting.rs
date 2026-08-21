@@ -389,8 +389,22 @@ impl Setting {
     /// [`crate::project::Harvest`] for why the builtin list sits in the middle
     /// rather than at either end.
     pub fn wire_keyterm(&self) -> Vec<String> {
+        self.wire_keyterm_from(crate::project::cached_harvest(self.catalog_path.as_deref()))
+    }
+
+    /// The wire list computed synchronously, for `--check`.
+    ///
+    /// The live path reads a background-warmed cache so a take never waits; a
+    /// one-shot `--check` process has no warmed cache and would otherwise report
+    /// the builtin list alone — the opposite of what a diagnostic meant to show
+    /// the harvested bias should print.
+    pub fn wire_keyterm_sync(&self) -> Vec<String> {
+        self.wire_keyterm_from(crate::project::harvest(self.catalog_path.as_deref()))
+    }
+
+    fn wire_keyterm_from(&self, harvest: crate::project::Harvest) -> Vec<String> {
         let harvest = if self.use_project_keyterm {
-            crate::project::cached_harvest(self.catalog_path.as_deref())
+            harvest
         } else {
             crate::project::Harvest::default()
         };

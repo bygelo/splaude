@@ -13,7 +13,7 @@ cpal = "0.18"
 dirs = "6.0.0"
 enigo = "0.6"
 global-hotkey = "0.8.0"
-splaude-core = { version = "0.3.1", path = "../core" }
+splaude-core = { version = "0.3.2", path = "../core" }
 
 # Windows and macOS only, deliberately. The only thing here that touches the
 # clipboard is `Injector::paste`, and its only caller is the carve-out for

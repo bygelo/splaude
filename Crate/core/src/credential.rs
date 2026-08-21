@@ -224,10 +224,32 @@ impl Store {
         Err(first_failure.unwrap_or(CredentialError::NotFound))
     }
 
+    /// The credential's state for display, WITHOUT ever prompting.
+    ///
+    /// Health is shown on a timer that ticks whether or not the app is in use.
+    /// It must never read the source: on macOS a Keychain read is an ACL
+    /// decision, and the OS raises a login-password prompt whenever the "Always
+    /// Allow" grant does not apply — which is exactly the case the moment the
+    /// cached token passes expiry and Claude Code has rewritten the item with a
+    /// fresh one. Reading from a background timer therefore made the prompt
+    /// appear on its own, with no dictation in sight. So this classifies
+    /// whatever is already cached; the token is refreshed lazily by an actual
+    /// take (see `load`), the only place a source read — and its prompt — is
+    /// justified, because only a take truly needs a live token.
     pub fn health(&self) -> Health {
-        match self.load() {
-            Ok(credential) => classify(&credential, now_ms()),
-            Err(error) => Health::Missing(error.to_string()),
+        let cached = self
+            .cache
+            .lock()
+            .ok()
+            .and_then(|cache| cache.credential.clone());
+
+        match cached {
+            Some(credential) => classify(&credential, now_ms()),
+            // Nothing cached yet — the one read that has to happen, at launch.
+            None => match self.load() {
+                Ok(credential) => classify(&credential, now_ms()),
+                Err(error) => Health::Missing(error.to_string()),
+            },
         }
     }
 

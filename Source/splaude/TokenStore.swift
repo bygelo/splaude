@@ -135,12 +135,37 @@ enum TokenStore {
         }
     }
 
+    /// The credential's state for display, WITHOUT ever prompting.
+    ///
+    /// Health is shown on a five-minute timer that runs whether or not the app
+    /// is being used. It must never touch the Keychain: reading another app's
+    /// credential item is an ACL decision, and macOS puts up a login-password
+    /// prompt for it whenever the "Always Allow" grant does not apply — which is
+    /// exactly what happens the moment the cached token passes expiry and Claude
+    /// Code has rewritten the item with a fresh one. Poking the Keychain from a
+    /// background timer therefore made the password dialog appear on its own,
+    /// with no dictation in sight, every five minutes around each token refresh.
+    ///
+    /// So this classifies whatever is already cached and never reads. The token
+    /// is cached at launch and refreshed lazily by an actual take (see `load`),
+    /// which is the only place a Keychain read — and its possible prompt — is
+    /// justified, because only a take truly needs a live token.
     static func health() -> Health {
-        do {
-            return classify(try load())
-        } catch {
-            return .missing(error.localizedDescription)
+        lock.lock()
+        let known = cached
+        lock.unlock()
+
+        guard let known else {
+            // Nothing cached yet — the one read that has to happen. At launch
+            // this is the read the app would do anyway; there is no extra
+            // prompt beyond the one first-run grant.
+            do {
+                return classify(try load())
+            } catch {
+                return .missing(error.localizedDescription)
+            }
         }
+        return classify(known)
     }
 
     /// Split from `health()` so the thresholds can be exercised against crafted

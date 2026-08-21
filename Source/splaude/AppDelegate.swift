@@ -61,6 +61,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         capture.requestPermission { _ in }
         if !TextInserter.isTrusted { TextInserter.requestTrust() }
 
+        // Warm the project bias in the background now, so the first take carries
+        // it instead of triggering the harvest on the hotkey path.
+        if Setting.useProjectKeyterm {
+            let catalog = Setting.catalogPath
+            Project.warm(catalog: catalog.isEmpty ? nil : URL(fileURLWithPath: catalog))
+        }
+
         // Same reasoning for the credential: read it now, so the Keychain
         // prompt lands at launch rather than mid-thought on the first take.
         refreshCredentialHealth()
@@ -579,6 +586,7 @@ extension AppDelegate: SpeechBackendDelegate {
     }
 
     func speechDidFail(_ message: String, fatal: Bool) {
+        Diagnostic.log("stt", "fail (fatal: \(fatal)): \(message)")
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             if fatal || self.isRecording {

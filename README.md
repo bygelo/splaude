@@ -35,6 +35,7 @@ so if you have run `claude` once, there is nothing else to set up.
 ### macOS
 
 Grab the latest zip from [Releases](https://github.com/bygelo/splaude/releases),
+Grab `splaude-*-macos.zip` from [Releases](https://github.com/bygelo/splaude/releases),
 drag `splaude.app` to `/Applications`, then:
 
 ```sh
@@ -48,7 +49,11 @@ refuses to launch the app until the quarantine flag is cleared. For the same
 reason the signature changes on every release, and macOS treats each update as
 a new app, so expect to grant Accessibility again after upgrading.
 
-Building from source avoids both problems if you have a signing identity.
+Each release also ships experimental `windows-x64` and `linux-x64` binaries of
+the cross-platform Rust build. They compile and pass their tests everywhere but
+have had far less real-hardware use than the macOS app — see
+[docs/PORTING.md](docs/PORTING.md). Building from source avoids the signing
+friction above if you have a signing identity.
 
 ### Windows
 
@@ -258,7 +263,7 @@ Menu bar › **Settings…** (`⌘,`), in four tabs:
 | Tab | What's there |
 | --- | --- |
 | Dictation | Type-as-I-speak, focus guard, input anchoring, typing speed, language, hotkey recorder |
-| Vocabulary | Your keyterms, built-in developer list toggle, live budget meter |
+| Vocabulary | Your keyterms, built-in developer list toggle, project bias toggle, live budget meter |
 | General | Floating mic button, start/stop sound, launch at login, log |
 | Status | Accessibility, microphone, credential, and what the handshake said about quota |
 
@@ -314,6 +319,83 @@ only at utterance boundaries. The extension hides the same flag behind
 nouns, project names, jargon. It is appended to a built-in developer list and
 capped at 1024 characters, matching the server's budget. This is the single
 highest-leverage setting for accuracy.
+
+### Project bias
+
+Most of that budget now fills itself. The IDE extension seeds its recogniser
+from the workspace it is open in — the folder name and the words in the git
+branch. splaude has no workspace, so it infers one from the newest session log
+under `~/.claude/projects`, reading the `cwd` recorded inside the file rather
+than the directory name, which encodes `/`, `.` and `_` all as `-` and cannot
+be inverted.
+
+From there it harvests four things, ranked by how likely a dictation is to
+contain them:
+
+| Tier | Source |
+| --- | --- |
+| 1 | Your own keyterms — you typed them because something was being misheard |
+| 2 | The current project: name, git branch, crate or package name |
+| 3 | The built-in developer list |
+| 4 | The twenty repos you worked in most recently, then the machine's catalog |
+| 5 | The current project's directory names and the identifiers its README backticks |
+
+Order is the whole design: packing truncates at 1024 characters rather than
+sampling, so whatever leads survives. Tier 4 is capped at half the budget so a
+machine with two hundred catalog entries cannot evict `TypeScript`.
+
+Nothing to configure — the terms change when you change repo or branch.
+
+```sh
+defaults write com.bygelo.splaude useProjectKeyterm -bool false   # turn it off
+defaults write com.bygelo.splaude catalogPath ~/.booted/inventory.json
+```
+
+`catalogPath` names any JSON inventory of the machine's own infrastructure.
+splaude walks it and keeps the values under name-like keys — `name`, `project`,
+`host`, `host_code`, `slug`, `alias` — skipping objects that have a `pid`,
+because a running process's name is an OS artefact and not a word anyone says.
+Left unset it probes `~/.booted/inventory.json`. A file rather than an endpoint:
+a file read cannot hang on the hotkey path, and splaude has no business shipping
+an HTTP client that talks to whatever a setting points at.
+
+`splaude --check` prints the resolved project, the catalog size, the recent
+list, and the exact string that goes on the wire.
+
+The list is capped at **64 terms** as well as 1024 characters. The cap is not
+cosmetic: the endpoint answers a request carrying too many keyterms with
+`TranscriptError` and drops the socket, so an uncapped harvest does not produce
+a weaker bias — it produces no transcript at all. Synthetic speech tripped that
+at 94 terms and live takes tripped it at 90, so the ceiling sits well below
+either.
+
+### Does the bias actually help?
+
+`splaude --bench` answers that with a measurement rather than an impression.
+It records a phrase **once** and replays the identical PCM down two sockets, one
+carrying the keyterm list and one carrying nothing, so the only difference
+between the two transcripts is the bias. Saying a phrase twice would measure
+your own mouth instead.
+
+```sh
+splaude --bench "push polkadoc and blead to bygelo"   # hold-to-talk
+splaude --bench --say "push polkadoc and blead to bygelo"   # speak it with `say`
+```
+
+`--say` needs no microphone and is repeatable, which makes it the right tool for
+checking a change to the harvester. It is synthetic speech, so the absolute
+score means little — but both passes get byte-identical audio, so the difference
+between them is real. On this machine, over five phrases:
+
+| | Target words recovered |
+| --- | --- |
+| With the bias | 14 / 21 |
+| Without | 11 / 21 |
+
+`polkadoc`, `bygelo` and `splaude` come back correct with the bias and as
+`polka dot`, `Bygela` and `Sblod` without it. `blead` stays `bleed` either way:
+a keyterm raises the odds on a word, it does not guarantee one, and `bleed` is
+a real English word competing for the same sound.
 
 ## How it works
 

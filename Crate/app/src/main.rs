@@ -254,6 +254,12 @@ fn run() -> Result<()> {
             format!("{line} — using defaults ({})", Setting::path().display()),
         );
     }
+    // Warm the project bias in the background now, so the first take carries it
+    // instead of triggering the harvest on the hotkey path.
+    if setting.use_project_keyterm {
+        splaude_core::project::warm(setting.catalog_path.as_deref());
+    }
+
     let store = Arc::new(credential_store());
     let capability = Capability::detect();
 
@@ -404,6 +410,9 @@ fn run() -> Result<()> {
                     }
                     Err(error) => eprintln!("splaude: {error:#}"),
                 }
+                if let Some(shown) = status.as_mut() {
+                    shown.set_project(project_name(&setting), setting.use_project_keyterm);
+                }
             }
 
             Event::UserEvent(Wake::Hotkey(edge)) => {
@@ -472,6 +481,9 @@ fn run() -> Result<()> {
                         #[cfg(not(target_os = "linux"))]
                         if let Some(shown) = status.as_mut() {
                             shown.set_mood(tray::Mood::Idle);
+                            // The harvest ran for this take, so the resolved
+                            // project is fresh and free to read here.
+                            shown.set_project(project_name(&setting), setting.use_project_keyterm);
                         }
                     }
 
@@ -606,6 +618,16 @@ fn run() -> Result<()> {
                     // promise the app will not keep at the next login.
                     if let Some(shown) = status.as_mut() {
                         shown.set_autostart(autostart::is_enabled());
+                    }
+                }
+
+                tray::Ask::ToggleProjectKeyterm => {
+                    setting.use_project_keyterm = !setting.use_project_keyterm;
+                    if let Err(error) = setting.save() {
+                        eprintln!("splaude: could not save the setting: {error}");
+                    }
+                    if let Some(shown) = status.as_mut() {
+                        shown.set_project(project_name(&setting), setting.use_project_keyterm);
                     }
                 }
 
@@ -906,6 +928,30 @@ fn check() -> Result<()> {
     }
     println!("  file      {}", Setting::path().display());
     println!("  log       {}", diagnostic::path().display());
+    println!();
+
+    // The whole point of project bias is that the user never configures it, so
+    // this is the only place they can see what it decided. A wrong project or a
+    // wrong term is otherwise invisible until a dictation comes back mangled.
+    println!("recogniser bias");
+    match splaude_core::project::active() {
+        Some(project) if setting.use_project_keyterm => {
+            println!("  project   {} ({})", project.name, project.root.display());
+        }
+        Some(project) => println!("  project   {} — off in the setting", project.name),
+        None => println!("  project   none — no recent Claude Code session"),
+    }
+    match splaude_core::project::catalog_keyterm(setting.catalog_path.as_deref()) {
+        found if found.is_empty() => println!("  catalog   none found"),
+        found => println!("  catalog   {} name", found.len()),
+    }
+    println!(
+        "  recent    {}",
+        splaude_core::project::recent_name(8).join(", ")
+    );
+    let packed = splaude_core::speech::anthropic::pack_keyterm(&setting.wire_keyterm());
+    println!("  budget    {} of 1024 characters", packed.len());
+    println!("  keyterm   {packed}");
 
     Ok(())
 }
@@ -926,6 +972,19 @@ fn mark(yes: bool) -> &'static str {
     } else {
         "no"
     }
+}
+
+/// The project name shown in the tray, or `None` when bias is off or nothing
+/// resolved.
+///
+/// Resolution is skipped entirely when the setting is off: reading someone's
+/// session log to label a menu item they have switched off is work they did not
+/// ask for.
+fn project_name(setting: &Setting) -> Option<String> {
+    if !setting.use_project_keyterm {
+        return None;
+    }
+    splaude_core::project::active().map(|project| project.name)
 }
 
 #[cfg(test)]

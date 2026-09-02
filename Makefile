@@ -4,12 +4,15 @@ CONFIG  := release
 BINARY  := $(shell swift build -c $(CONFIG) --show-bin-path 2>/dev/null)/$(APP)
 
 # One version for the whole product, read from the Rust workspace because that
-# is where releases are stamped from. `Resource/Info.plist` is committed reading
+# is where releases are stamped from. `awk` on a quote separator rather than a
+# `sed` backreference: the backslashes in `` are one editor away from being
+# eaten, and when they were, this silently produced a control character and
+# stamped nothing at all. `Resource/Info.plist` is committed reading
 # 0.1.0 and only the release workflow rewrites it, so before this every locally
 # built bundle claimed 0.1.0 for ever — which is not cosmetic when the way you
 # check an install worked is to ask the bundle what version it is. It cost an
 # afternoon of believing a good install was a stale one.
-VERSION := $(shell sed -n 's/^version = "\(.*\)"//p' Cargo.toml | head -1)
+VERSION := $(shell awk -F'"' '/^version = /{print $$2; exit}' Cargo.toml)
 
 # TCC pins the Accessibility grant to the code signature. An ad-hoc signature
 # gets a fresh cdhash on every rebuild, which reads as a different app and makes

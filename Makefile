@@ -3,6 +3,14 @@ BUNDLE  := build/$(APP).app
 CONFIG  := release
 BINARY  := $(shell swift build -c $(CONFIG) --show-bin-path 2>/dev/null)/$(APP)
 
+# One version for the whole product, read from the Rust workspace because that
+# is where releases are stamped from. `Resource/Info.plist` is committed reading
+# 0.1.0 and only the release workflow rewrites it, so before this every locally
+# built bundle claimed 0.1.0 for ever — which is not cosmetic when the way you
+# check an install worked is to ask the bundle what version it is. It cost an
+# afternoon of believing a good install was a stale one.
+VERSION := $(shell sed -n 's/^version = "\(.*\)"//p' Cargo.toml | head -1)
+
 # TCC pins the Accessibility grant to the code signature. An ad-hoc signature
 # gets a fresh cdhash on every rebuild, which reads as a different app and makes
 # you re-grant each time — so prefer a real identity when one exists.
@@ -32,10 +40,11 @@ bundle: build
 	rm -rf $(BUNDLE)
 	mkdir -p $(BUNDLE)/Contents/MacOS $(BUNDLE)/Contents/Resources
 	cp Resource/Info.plist $(BUNDLE)/Contents/Info.plist
+	@[ -n "$(VERSION)" ] && /usr/libexec/PlistBuddy -c 	  "Set :CFBundleShortVersionString $(VERSION)" $(BUNDLE)/Contents/Info.plist || true
 	cp Resource/$(APP).icns $(BUNDLE)/Contents/Resources/$(APP).icns
 	cp $(BINARY) $(BUNDLE)/Contents/MacOS/$(APP)
 	codesign --force --sign "$(SIGN)" --identifier com.bygelo.splaude $(BUNDLE)
-	@echo "built $(BUNDLE) — signed with $(SIGN)"
+	@echo "built $(BUNDLE) $(VERSION) — signed with $(SIGN)"
 
 LSREGISTER := /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
 

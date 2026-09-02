@@ -290,6 +290,16 @@ pub struct Setting {
     /// Terms the user added. Kept separate so the built-in list is never lost.
     pub custom_keyterm: Vec<String>,
     pub use_builtin_keyterm: bool,
+    /// Bias the recogniser with the project Claude Code was last used in.
+    ///
+    /// The IDE extension does this from its own workspace; splaude has none, so
+    /// it infers one. See [`crate::project`] for what is read and why.
+    pub use_project_keyterm: bool,
+    /// A JSON inventory of this machine's own infrastructure, harvested for the
+    /// proper nouns in it — hosts, sites, databases, repos that live only on a
+    /// server. `None` probes the locations splaude already knows about; see
+    /// [`crate::project::catalog_keyterm`].
+    pub catalog_path: Option<PathBuf>,
     pub language: String,
     /// Which speech provider a take goes to: `anthropic` (the default) or
     /// `deepgram`.
@@ -376,6 +386,8 @@ impl Default for Setting {
         Self {
             custom_keyterm: Vec::new(),
             use_builtin_keyterm: true,
+            use_project_keyterm: true,
+            catalog_path: None,
             language: "en".into(),
             speech_backend: "anthropic".into(),
             api_key: String::new(),
@@ -438,7 +450,54 @@ fn bare_executable(name: &str) -> &str {
 }
 
 impl Setting {
-    /// What actually goes on the wire.
+    /// What actually goes on the wire, project bias interleaved.
+    ///
+    /// Packing truncates at the wire budget rather than sampling, so this order
+    /// *is* the priority. Terms the user typed lead: they were added because
+    /// something was being misheard, and nothing harvested outranks that. See
+    /// [`crate::project::Harvest`] for why the builtin list sits in the middle
+    /// rather than at either end.
+    pub fn wire_keyterm(&self) -> Vec<String> {
+        self.wire_keyterm_from(crate::project::cached_harvest(self.catalog_path.as_deref()))
+    }
+
+    /// The wire list computed synchronously, for `--check`.
+    ///
+    /// The live path reads a background-warmed cache so a take never waits; a
+    /// one-shot `--check` process has no warmed cache and would otherwise report
+    /// the builtin list alone — the opposite of what a diagnostic meant to show
+    /// the harvested bias should print.
+    pub fn wire_keyterm_sync(&self) -> Vec<String> {
+        self.wire_keyterm_from(crate::project::harvest(self.catalog_path.as_deref()))
+    }
+
+    fn wire_keyterm_from(&self, harvest: crate::project::Harvest) -> Vec<String> {
+        let harvest = if self.use_project_keyterm {
+            harvest
+        } else {
+            crate::project::Harvest::default()
+        };
+
+        let builtin: Vec<String> = if self.use_builtin_keyterm {
+            BUILTIN_KEYTERM
+                .iter()
+                .map(|term| term.to_string())
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        [
+            self.custom_keyterm.clone(),
+            harvest.identity,
+            builtin,
+            harvest.house,
+            harvest.vocabulary,
+        ]
+        .concat()
+    }
+
+    /// The configured terms alone — builtin plus custom, no filesystem read.
     pub fn keyterm(&self) -> Vec<String> {
         let builtin = if self.use_builtin_keyterm {
             BUILTIN_KEYTERM
@@ -569,6 +628,11 @@ impl Setting {
                 "useBuiltinKeyterm",
                 self.use_builtin_keyterm != other.use_builtin_keyterm,
             ),
+            (
+                "useProjectKeyterm",
+                self.use_project_keyterm != other.use_project_keyterm,
+            ),
+            ("catalogPath", self.catalog_path != other.catalog_path),
             ("language", self.language != other.language),
             ("speechBackend", self.speech_backend != other.speech_backend),
             ("apiKey", self.api_key != other.api_key),
@@ -734,6 +798,22 @@ mod test {
         };
         setting.normalise();
         assert_eq!(setting.hotkey, Hotkey::default());
+    }
+
+    #[test]
+    fn wire_keyterm_puts_custom_first_and_builtin_before_the_house() {
+        // Harvesting is off, so this asserts the tier order alone and does not
+        // depend on what is on the machine running the test.
+        let setting = Setting {
+            custom_keyterm: vec!["Ateneo".into()],
+            use_builtin_keyterm: true,
+            use_project_keyterm: false,
+            ..Default::default()
+        };
+        let wire = setting.wire_keyterm();
+        assert_eq!(wire.first().unwrap(), "Ateneo");
+        assert_eq!(wire[1], BUILTIN_KEYTERM[0]);
+        assert_eq!(wire.len(), BUILTIN_KEYTERM.len() + 1);
     }
 
     #[test]
@@ -967,6 +1047,8 @@ mod test {
         let other = Setting {
             custom_keyterm: vec!["splaude".into()],
             use_builtin_keyterm: false,
+            use_project_keyterm: false,
+            catalog_path: Some("/tmp/inventory.json".into()),
             language: "ja".into(),
             speech_backend: "deepgram".into(),
             api_key: "secret".into(),
@@ -992,7 +1074,7 @@ mod test {
         let named = Setting::default().difference(&other);
         assert_eq!(
             named.len(),
-            20,
+            22,
             "a field missing from difference is a field a reload changes in silence: {named:?}"
         );
         assert!(named.contains(&"hotkey".to_string()));

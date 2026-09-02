@@ -49,6 +49,9 @@ private final class SettingModel: ObservableObject {
 
     /// Edited as free text, one term per line — far less fiddly than a table.
     @Published var keytermText = Setting.customKeyterm.joined(separator: "\n")
+    @Published var useProjectKeyterm = Setting.useProjectKeyterm {
+        didSet { Setting.useProjectKeyterm = useProjectKeyterm }
+    }
 
     func commitKeyterm() {
         Setting.customKeyterm = keytermText
@@ -58,7 +61,14 @@ private final class SettingModel: ObservableObject {
     }
 
     var keytermBudget: Int {
-        AnthropicSpeechBackend.packKeyterm(Setting.keyterm).count
+        AnthropicSpeechBackend.packKeyterm(Setting.wireKeyterm).count
+    }
+
+    /// The project the bias resolved to, or nil when nothing did. Shown because
+    /// a bias the user cannot see is one they cannot debug when it picks the
+    /// wrong repo.
+    var projectName: String? {
+        useProjectKeyterm ? Project.active()?.name : nil
     }
 }
 
@@ -166,6 +176,15 @@ private struct SettingView: View {
             Section {
                 Toggle("Include built-in developer terms", isOn: $model.useBuiltinKeyterm)
                 Text(Setting.builtinKeyterm.joined(separator: ", "))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section {
+                Toggle("Bias for the current project", isOn: $model.useProjectKeyterm)
+                Text(model.projectName.map {
+                    "Reading “\($0)” — its name, branch and README, the repos you worked in recently, and this machine's catalog. Nothing to configure; the terms change when you change repo."
+                } ?? "No recent Claude Code session, so there is no project to read.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

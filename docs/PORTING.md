@@ -140,7 +140,7 @@ model, not a port of this one. It is out of scope.
 
 ## Done
 
-- `Crate/core` (140 tests) — the speech backend with its wire contract
+- `Crate/core` (144 tests) — the speech backend with its wire contract
   preserved verbatim, credential loading and health classification, settings,
   the transcript buffer, keyterm packing, quota inspection, diagnostics, and
   the live-typing diff extracted as pure logic. Ten of those drive the socket
@@ -290,15 +290,16 @@ sudo apt install pkg-config libasound2-dev libxdo-dev libxkbcommon-dev \
 ```
 
 ```sh
-cargo test --all        # 314 tests across the workspace
+cargo test --all        # 318 tests across the workspace
 cargo clippy --all-targets --all-features -- -D warnings
 cargo fmt --all --check
 cargo run -p splaude-app -- --check    # credential and capability report
 cargo build --release                  # target/release/splaude
 ```
 
-The Swift build still builds with `make` and now has 33 tests of its own via
-`swift test`. It is mostly untouched by the port, the exception being fixes
-that apply to both builds — the remote-desktop paste carve-out is in each.
+The Swift build still builds with `make` and has 54 tests of its own via
+`swift test`. Most of the port does not touch it, the exceptions being changes
+that apply to both builds — the remote-desktop paste carve-out and the
+project-aware recogniser bias are in each.
 Both suites run on every push and pull request through the `Check` workflow,
 across Linux, macOS and Windows, all four legs green.

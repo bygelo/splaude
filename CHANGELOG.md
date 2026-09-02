@@ -8,16 +8,15 @@ Notable changes to splaude. Format follows
 
 ### Fixed
 
-- **Keyterms past the recogniser's ceiling are no longer sent and ignored.**
-  There are two limits and only one was enforced. 1024 characters is the header
-  budget; the recogniser separately documents keyterm prompting as covering
-  about a hundred terms. With names of ordinary length the two bind at roughly
-  the same place, so most people never saw a difference — but a list of two
-  hundred short names fits inside the header comfortably, was sent whole, and
-  everything past the ceiling did nothing at all. Packing now stops at both, and
-  the settings window shows both rather than only the one that was easy to
-  count. The hundred is second-hand from the provider's documentation; nobody
-  here has measured recall at term 101, and the code says so where it is used.
+- The keyterm budget meter counts against the limit the wire actually enforces.
+  It showed characters only, and 0.3.0 had already established — by measuring
+  the live endpoint, where 93 terms transcribe and 94 fail outright — that the
+  binding limit is a *term count* of 64, and that exceeding it produces no text
+  at all rather than a truncated bias. A meter reading "238 / 1024 characters"
+  while the wire silently stopped at 64 terms was the wrong number in the one
+  place a user goes to find out whether their list fits. It now reads both, from
+  the same constant the packer uses.
+
 - **A newline in a transcript no longer presses Return.** `enigo` special-cases
   `'\n'` on Windows into a real `VK_RETURN` click, so a transcript containing one
   submitted whatever the user was dictating into — a chat message sent
@@ -92,24 +91,6 @@ Notable changes to splaude. Format follows
   app on the keycode list and so is remote by construction: a 250 ms lead before
   the chord, 12 ms either side of the keystroke inside it, and the clipboard
   held for 2 s rather than 0.35.
-- The test suite no longer writes into the real log. Opening the log file used
-  to be automatic, so anything that linked `splaude-core` and logged a line
-  appended to `splaude.log` — including every test, run in parallel by cargo,
-  which interleaved fragments of unrelated runs into the one file *Reveal Log*
-  exists to show when dictation misbehaves. The file is now something a program
-  asks for with `diagnostic::to_file`, which only the dictation loop does; a
-  test cannot pollute it by forgetting to opt out. `--check` no longer creates a
-  log file either — a report that silently writes somewhere is a report that
-  surprises whoever ran it.
-- Log lines can no longer interleave. The file handle is held across the write
-  rather than reopened per line, so two threads cannot split each other's
-  sentences.
-- A startup that fails now says so in the log. The error was returned to the
-  runtime, which prints it to stderr — and a tray app launched from Explorer, a
-  shortcut or launch-at-login has no stderr anyone will read. What that looked
-  like from outside was the whole failure mode this log exists to prevent: no
-  icon, a hotkey that does nothing, and a log holding a `start` line with
-  nothing after it. Found in a real log, not in the suite.
 
 ### Added
 
@@ -292,6 +273,118 @@ Notable changes to splaude. Format follows
   leaving the user to guess a string they have no way to see. It is now on the
   `record` line of every take, ready to paste into the custom list.
 - NoMachine, Jump Desktop, UTM and VirtualBox join the built-in paste-only list.
+
+## [0.3.2] — 2026-08-21
+
+### Fixed
+
+- The Keychain password prompt no longer appears on its own. Credential health
+  is shown on a five-minute timer that runs whether or not you are dictating,
+  and it read the token by going to the Keychain — an ACL decision macOS answers
+  with a login-password dialog whenever the "Always Allow" grant does not apply,
+  which is exactly the case the moment the token passes expiry and Claude Code
+  has rewritten the item with a fresh one. So the dialog surfaced spontaneously,
+  every few minutes around each token refresh, with no take in sight. Health now
+  classifies the already-cached token and never reads on a timer; the Keychain
+  is read only by an actual take, which is the only thing that needs a live
+  token. Fixed in both builds. (A rebuild still invalidates "Always Allow"
+  because an ad-hoc signature's code hash changes every build — that part is
+  inherent to shipping unnotarized.)
+
+
+## [0.3.1] — 2026-08-21
+
+### Fixed
+
+- `--check` reported the builtin list alone, not the project bias. It reads the
+  same wire list a take does, and that list now comes from a background-warmed
+  cache which a one-shot `--check` process has not had time to fill — so the one
+  diagnostic meant to show the harvested terms showed none of them. It now
+  harvests synchronously, which a short-lived report can afford and a take
+  cannot. The live dictation path is unchanged.
+
+
+## [0.3.0] — 2026-08-21
+
+### Fixed
+
+- **The project harvest hung the take by several seconds.** Resolving the
+  active project read every Claude Code session log whole — 3200+ files, 2.5 GB
+  here — to pull a `cwd` from line five, synchronously on the hotkey path, so
+  the microphone did not open for whole seconds after the keypress. Three fixes:
+  the harvest now runs on a background queue and a take reads the last cached
+  result instantly (warmed at launch, refreshed every five minutes, never
+  computed inline); recency is ranked by project-*directory* mtime, one `stat`
+  each, instead of by per-file mtime across thousands of files; and `cwd` is
+  read from a bounded 64 KB prefix rather than the whole transcript. Cold first
+  scan is ~11 s of background work at launch; every take after is instant.
+- **A harvest past 93 terms silenced dictation entirely.** The endpoint answers
+  a take carrying more than 93 keyterms with `TranscriptError` and drops the
+  socket — not a truncated bias, no text at all. Both builds now cap at 64
+  terms alongside the existing 1024-character budget — synthetic speech tripped
+  the limit at 94 and live takes at 90, so the ceiling sits clear of both. Found by bisecting
+  against the live endpoint with `--bench --say`; only the byte budget was
+  bounded before, and the new project harvest routinely produces 145 terms.
+- **Keyterms are sent in the `x-config-keyterms` header only.** The 2.1.98
+  extension bundle appends one `keyterms` query parameter per term and sends no
+  such header, so splaude briefly sent both to cover either. Measurement says
+  that was backwards: a take carrying `keyterms` parameters fails with
+  `TranscriptError` whether or not the header rides along, while the header
+  alone transcribes and measurably biases the result. Whatever the extension
+  talks to, it is not what this credential reaches. The header splaude has
+  always sent was working; an earlier line here claiming otherwise was wrong.
+- The test suite no longer writes into the real log. Opening the log file used
+  to be automatic, so anything that linked `splaude-core` and logged a line
+  appended to `splaude.log` — including every test, run in parallel by cargo,
+  which interleaved fragments of unrelated runs into the one file *Reveal Log*
+  exists to show when dictation misbehaves. The file is now something a program
+  asks for with `diagnostic::to_file`, which only the dictation loop does; a
+  test cannot pollute it by forgetting to opt out. `--check` no longer creates a
+  log file either — a report that silently writes somewhere is a report that
+  surprises whoever ran it.
+- Log lines can no longer interleave. The file handle is held across the write
+  rather than reopened per line, so two threads cannot split each other's
+  sentences.
+- A startup that fails now says so in the log. The error was returned to the
+  runtime, which prints it to stderr — and a tray app launched from Explorer, a
+  shortcut or launch-at-login has no stderr anyone will read. What that looked
+  like from outside was the whole failure mode this log exists to prevent: no
+  icon, a hotkey that does nothing, and a log holding a `start` line with
+  nothing after it. Found in a real log, not in the suite.
+
+### Added
+
+- **Project-aware recogniser bias**, in both the Swift and the Rust build. The IDE extension seeds
+  its recogniser with the workspace it is open in; splaude has no workspace, so
+  it infers one from the newest session log under `~/.claude/projects` — the
+  `cwd` field inside the file, not the directory name, which encodes `/`, `.`
+  and `_` all as `-` and cannot be inverted. From that directory it harvests the
+  project name, the branch words in `.git/HEAD`, the crate or package name, the
+  top-level directory names, and the identifiers the README puts in backticks.
+  Nothing to configure: the terms change when you change repo or branch. Visible
+  in the tray and in `--check`, and switchable off there.
+- **House and catalog bias.** The words a dictation gets wrong are rarely inside
+  the file you have open, so two sources rank above the current project's own
+  README vocabulary: the twenty most recently worked-in projects, taken from the
+  same session scan that already ran, and a JSON catalog of the machine's
+  infrastructure. `catalog_path` names any inventory file; splaude walks it and
+  keeps the values under name-like keys (`name`, `project`, `host`, `slug`,
+  `host_code`, `alias`), skipping objects with a `pid` because a running
+  process's name is an OS artefact and not a word anyone says. Unset, it probes
+  `~/.booted/inventory.json`. A file, not the endpoint that serves the same
+  data: a file read cannot hang on the hotkey path, and splaude has no business
+  shipping an HTTP client that talks to whatever a setting points at.
+- Tier ordering, because packing truncates at the wire budget rather than
+  sampling. Custom terms lead — they were typed because something was being
+  misheard. Then the project's identity, then the builtin developer list, then
+  the house (capped at half the budget so a machine with two hundred catalog
+  entries cannot evict `TypeScript`), then the current README's identifiers.
+- **`splaude --bench`** — a keyterm A/B that records a phrase once and replays
+  the identical audio down two sockets, one biased and one not, so the only
+  difference between the transcripts is the bias rather than how the phrase was
+  said the second time. `--say` renders the phrase with the system voice for a
+  repeatable, microphone-free check of a harvester change. Measured 14/21
+  target words recovered with the bias against 11/21 without.
 - splaude says when a newer version has been published. It asks GitHub once at
   startup and whenever the menu item is clicked, and the item does double duty:
   an update that exists opens the release page, anything else goes and looks

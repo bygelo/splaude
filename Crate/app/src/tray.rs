@@ -45,6 +45,7 @@ const OPEN_SETTING: &str = "splaude:open-setting";
 const EDIT_SETTING: &str = "splaude:edit-setting";
 const RELOAD_SETTING: &str = "splaude:reload-setting";
 const UPDATE: &str = "splaude:update";
+const PROJECT_KEYTERM: &str = "splaude:project-keyterm";
 
 /// Longest transcript preview the menu will show, in characters.
 ///
@@ -93,6 +94,7 @@ pub enum Ask {
     /// reading, so the click stays one `Ask` rather than two the tray would
     /// have to choose between.
     Update,
+    ToggleProjectKeyterm,
     /// A click on a label, or on an id from some other `muda` consumer.
     Ignore,
 }
@@ -114,6 +116,11 @@ pub struct Tray {
     /// checked GitHub every time it was drawn would spend its hourly allowance
     /// on someone opening the menu.
     update: update::Reading,
+    /// Whether project bias is on, and the project it resolved to. The name is
+    /// shown because a bias the user cannot see is a bias they cannot debug
+    /// when it picks the wrong repo.
+    project_keyterm: bool,
+    project: Option<String>,
 }
 
 impl Tray {
@@ -143,6 +150,8 @@ impl Tray {
             transcript: None,
             autostart,
             update: update::Reading::Unknown,
+            project_keyterm: true,
+            project: None,
         };
         tray.rebuild()?;
 
@@ -234,6 +243,16 @@ impl Tray {
 
     /// Rebuild so the quota line is re-read. Nothing else here changes.
     pub fn refresh(&self) {
+        self.redraw_menu();
+    }
+
+    /// Refresh the resolved project shown in the menu.
+    pub fn set_project(&mut self, name: Option<String>, enabled: bool) {
+        if self.project == name && self.project_keyterm == enabled {
+            return;
+        }
+        self.project = name;
+        self.project_keyterm = enabled;
         self.redraw_menu();
     }
 
@@ -361,6 +380,24 @@ impl Tray {
 
         append(
             &menu,
+            &CheckMenuItem::with_id(
+                PROJECT_KEYTERM,
+                match (&self.project, self.project_keyterm) {
+                    (Some(name), true) => format!("Bias for “{name}” and the house"),
+                    (Some(name), false) => format!("Bias for “{name}” (off)"),
+                    (None, _) => "Bias for the current project".to_string(),
+                },
+                // Nothing to toggle when no project resolved and the box is
+                // already clear — turning it on would change nothing visible.
+                self.project.is_some() || !self.project_keyterm,
+                self.project_keyterm,
+                None,
+            ),
+        )?;
+        append(&menu, &PredefinedMenuItem::separator())?;
+
+        append(
+            &menu,
             &CheckMenuItem::with_id(AUTOSTART, "Launch at login", true, self.autostart, None),
         )?;
         // The settings pair together, above the diagnostics: the file is the
@@ -431,6 +468,7 @@ pub fn ask(id: &MenuId) -> Ask {
         UPDATE => Ask::Update,
         DICTATE => Ask::ToggleDictation,
         CREDENTIAL => Ask::CredentialHelp,
+        PROJECT_KEYTERM => Ask::ToggleProjectKeyterm,
         _ => Ask::Ignore,
     }
 }

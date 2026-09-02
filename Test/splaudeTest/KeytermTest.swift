@@ -67,3 +67,38 @@ final class KeytermTest: XCTestCase {
         XCTAssertTrue(packed.contains("worktree"))
     }
 }
+
+/// The transport, separately from the packing.
+///
+/// splaude briefly sent keyterms as `keyterms` query parameters as well as in
+/// the `x-config-keyterms` header, because the 2.1.98 extension bundle sends
+/// them that way. Measured against the live endpoint, a take carrying those
+/// parameters is answered with `TranscriptError` and a dropped socket — with or
+/// without the header alongside — while the header alone transcribes and
+/// measurably biases the result. These lock the header contract and the term
+/// ceiling that the same measurement found.
+final class KeytermTransportTest: XCTestCase {
+
+    func testNormaliseReturnsTheTermsThePackerJoins() {
+        let term = ["one,two", "grep", "grep", "  h\u{e9}llo w\u{f6}rld  "]
+        XCTAssertEqual(
+            AnthropicSpeechBackend.normaliseKeyterm(term).joined(separator: ","),
+            AnthropicSpeechBackend.packKeyterm(term)
+        )
+    }
+
+    func testStopsAtTheServersTermCeiling() {
+        // 93 terms transcribe and 94 fail outright, so a harvest that grew past
+        // the ceiling would not degrade the bias — it would produce no text at
+        // all. This is the guard against that regression.
+        let term = (0..<400).map { "term\($0)aaa" }
+        let kept = AnthropicSpeechBackend.normaliseKeyterm(term)
+        XCTAssertLessThanOrEqual(kept.count, 64)
+        XCTAssertEqual(kept.count, 64, "the ceiling, not the byte budget, should bind here")
+    }
+
+    func testStillStopsAtTheByteBudgetWhenTermsAreLong() {
+        let term = (0..<64).map { String(repeating: "a", count: 60) + "\($0)" }
+        XCTAssertLessThanOrEqual(AnthropicSpeechBackend.packKeyterm(term).count, 1024)
+    }
+}

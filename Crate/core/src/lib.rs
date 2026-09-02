@@ -8,6 +8,7 @@
 
 pub mod credential;
 pub mod diagnostic;
+pub mod project;
 pub mod quota;
 pub mod replacement;
 pub mod setting;
@@ -16,6 +17,7 @@ pub mod typer;
 pub mod update;
 
 pub use credential::{Credential, CredentialError, CredentialSource, Health, Store};
+pub use project::Project;
 pub use replacement::Rule;
 pub use setting::{Code, Hotkey, Modifiers, Setting};
 pub use speech::{SpeechAudioFormat, SpeechEvent, TranscriptBuffer};

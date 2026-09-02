@@ -125,9 +125,10 @@ mod backend {
     /// why the last term they added did nothing.
     const KEYTERM_BUDGET: usize = 1024;
 
-    /// The other ceiling: how many terms the recogniser will take, whatever
-    /// the character budget allows. See `pack_keyterm`.
-    const KEYTERM_TERM_CEILING: usize = 100;
+    /// How many terms the wire will actually carry, read from the one place
+    /// that measured it rather than copied here. Past it the server does not
+    /// truncate the bias — it rejects the take and produces no text at all.
+    use splaude_core::speech::anthropic::KEYTERM_COUNT_BUDGET as KEYTERM_TERM_CEILING;
 
     const PAGE_COUNT: usize = 4;
 

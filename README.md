@@ -357,9 +357,20 @@ keystrokes.
 
 ### Windows
 
-There is no settings window yet. Settings are a JSON file, and the tray menu
-opens it (**Edit Settings…**) and re-reads it (**Reload Settings**) without a
-restart:
+Tray › **Settings…**, or `splaude.exe --settings` when the tray icon is still
+hidden in the `^` overflow. Four tabs, the same four the Mac has:
+
+| Tab | What's there |
+| --- | --- |
+| Dictation | Type-as-I-speak, focus guard, input anchoring, latch timeout, typing speed, language, hotkey recorder |
+| Vocabulary | Your keyterms, built-in developer list toggle, budget meter, corrections |
+| General | Floating mic button, start/stop sound, launch at login, log |
+| Status | Credential, speech provider and key, microphone, capability, connection |
+
+The file underneath is still the interface, and the tray still opens it
+(**Edit Settings…**) and re-reads it (**Reload Settings**) without a restart —
+which is the way in when a setting has no control, and the only way to see what
+is wrong with a file that will not parse:
 
 ```
 %APPDATA%\splaude\setting.json
@@ -368,12 +379,38 @@ restart:
 ```json
 {
   "hotkey": "F9",
-  "liveTyping": true,
   "language": "en",
+  "speechBackend": "anthropic",
+  "apiKey": "",
+
+  "liveTyping": true,
+  "typingInterval": 1200,
+  "guardFocus": true,
+  "anchorInput": true,
+  "stopOnReturn": true,
+  "latchTimeoutSecond": 30,
+
   "customKeyterm": ["Ateneo", "OrSem", "Supabase"],
-  "launchAtLogin": true
+  "useBuiltinKeyterm": true,
+  "replacement": { "Cloud Code": "Claude Code" },
+
+  "customKeycodeApp": [],
+  "useBuiltinKeycodeApp": true,
+  "bufferOnlyApp": [],
+
+  "showFloatingButton": true,
+  "playSound": false,
+  "launchAtLogin": false
 }
 ```
+
+That is every setting; the ones needing more than a line are described below.
+`guardFocus` refuses to type into anything the platform can prove is not a text
+field, `anchorInput` pins a take to the field it started in, `stopOnReturn` ends
+a take when you submit, and `useBuiltinKeyterm` / `useBuiltinKeycodeApp` turn
+off the lists splaude ships without losing the ones you wrote.
+`floatingButtonPoint` is written by the button when you drag it, and is not
+worth setting by hand.
 
 `hotkey` is written the way the menu shows it — `F9`, `Ctrl+Shift+KeyD` — using
 [W3C key codes](https://www.w3.org/TR/uievents-code/), so a binding lands on

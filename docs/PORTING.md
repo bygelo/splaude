@@ -140,18 +140,18 @@ model, not a port of this one. It is out of scope.
 
 ## Done
 
-- `Crate/core` (97 tests) — the speech backend with its wire contract
+- `Crate/core` (140 tests) — the speech backend with its wire contract
   preserved verbatim, credential loading and health classification, settings,
   the transcript buffer, keyterm packing, quota inspection, diagnostics, and
   the live-typing diff extracted as pure logic. Ten of those drive the socket
   loop against a local WebSocket server rather than Anthropic, which is what
   caught a hand-built upgrade request that would have failed every connection.
-- `Crate/platform` (87 tests) — every OS binding. Audio capture on `cpal` with a
+- `Crate/platform` (104 tests, plus 6 quarantined) — every OS binding. Audio capture on `cpal` with a
   hand-rolled windowed-sinc resampler standing in for `AVAudioConverter`; the
   push-to-talk hotkey on `global-hotkey`, reporting both edges; text injection
   on `enigo`; the focus guard; launch at login. Only the last two needed
   per-OS code.
-- `Crate/app` (33 tests) — a binary on a `tao` main-thread event loop.
+- `Crate/app` (70 tests) — a binary on a `tao` main-thread event loop.
   `splaude` runs the dictation loop and lives in the tray; `splaude --check`
   reports credential, capability and settings state without opening a window, a
   microphone or a loop, so it is safe over SSH and in CI.
@@ -193,12 +193,21 @@ the whole workspace on Linux, macOS and Windows.
 
 That matters more for what it taught than for the milestone. **Every
 user-visible bug this port has had came from that use, and not one was
-reachable from the suite** — 217 green tests did not catch a held modifier
+reachable from the suite** — 217 green tests, as the suite stood then, did
+not catch a held modifier
 leaking spaces into a sentence, `Alt+Backspace` undoing each live-typing
 correction, a remote desktop turning a take into a run of `a`, a byte-order
 mark silently discarding the settings file, or a short take losing its tail.
 Each was found by a person holding a key, and each is fixed. Read the suite as
 protection against regression, not as evidence anything works.
+
+That reading is what `Crate/platform/tests/injection.rs` was written against.
+Three of those bugs were in one subsystem — synthetic input — which had thirteen
+tests, every one of them pure, while the socket that had never broken in the
+field carried 687 lines of integration test. The coverage was inverted with
+respect to the risk. There is now a harness that owns a real window and reads
+the characters back out of it, and it has been shown to go red on two of the
+exact regressions that shipped.
 
 Still unproven, and needing a person rather than a runner:
 
@@ -239,6 +248,11 @@ borrow. Introducing one satisfies both, and CI now compiles the result on
 
 ## Not done
 
+What is left, in priority order with a test attached to each, lives in
+[ROADMAP.md](../ROADMAP.md); what was considered and refused is in
+[roadmap-rejected.md](./roadmap-rejected.md). This section is the shape of the
+port, not the work queue.
+
 - macOS and Linux have no settings window and no floating mic button. Both are
   Win32 (see below), which is a decision about *this* platform rather than a
   toolkit for all three. macOS has the Swift build's own; Linux has no tray to
@@ -276,14 +290,14 @@ sudo apt install pkg-config libasound2-dev libxdo-dev libxkbcommon-dev \
 ```
 
 ```sh
-cargo test --all        # 151 tests across the workspace
+cargo test --all        # 314 tests across the workspace
 cargo clippy --all-targets --all-features -- -D warnings
 cargo fmt --all --check
 cargo run -p splaude-app -- --check    # credential and capability report
 cargo build --release                  # target/release/splaude
 ```
 
-The Swift build still builds with `make` and now has 32 tests of its own via
+The Swift build still builds with `make` and now has 33 tests of its own via
 `swift test`. It is mostly untouched by the port, the exception being fixes
 that apply to both builds — the remote-desktop paste carve-out is in each.
 Both suites run on every push and pull request through the `Check` workflow,

@@ -42,10 +42,24 @@ LSREGISTER := /System/Library/Frameworks/CoreServices.framework/Frameworks/Launc
 # Quit first, then replace. Swapping the bundle out from under a running copy
 # leaves LaunchServices holding a stale registration, and the next `open` fails
 # with -600.
+# Two bundles end up claiming `com.bygelo.splaude`: the one installed below, and
+# the one in `build/` that LaunchServices registers the moment `bundle` signs
+# it. `open` resolves a bundle identifier rather than a path, so it can pick the
+# build copy — which the next `make` deletes and recreates — and fail with -600,
+# the exact error the comment above swears this target prevents. That happened.
+# Quitting first does not address it, because the stale record is not the
+# running app's; it is a second bundle's.
+#
+# So the build copy is unregistered, leaving one claimant. Ghost records for
+# bundles that no longer exist at all — an old checkout path, a temp directory —
+# do the same thing, and are worth looking for when this recurs:
+#
+#     lsregister -dump | grep '^path:.*splaude.app'
 install: bundle
 	-pkill -x $(APP) 2>/dev/null || true
 	rm -rf /Applications/$(APP).app
 	cp -R $(BUNDLE) /Applications/
+	-$(LSREGISTER) -u $(BUNDLE) 2>/dev/null || true
 	$(LSREGISTER) -f /Applications/$(APP).app
 	@echo "installed to /Applications/$(APP).app"
 

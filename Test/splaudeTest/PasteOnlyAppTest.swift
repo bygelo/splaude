@@ -57,6 +57,16 @@ final class PasteOnlyAppTest: XCTestCase {
         XCTAssertFalse(Setting.isPasteOnly("com.microsoft.rdc.macos", within: []))
     }
 
+    func testAVirtualMachineConsoleIsPasteOnly() {
+        // A VM window re-encodes keystrokes for exactly the same reason a
+        // remote-desktop window does — there is a guest on the other side of
+        // the keyboard either way.
+        XCTAssertTrue(
+            Setting.isPasteOnly("org.virtualbox.app.VirtualBoxVM", within: Setting.builtinPasteOnlyApp)
+        )
+        XCTAssertTrue(Setting.isPasteOnly("com.utmapp.UTM", within: Setting.builtinPasteOnlyApp))
+    }
+
     func testTheBuiltinListIsWellFormed() {
         // A typo'd or blank identifier here would silently never match, which
         // looks exactly like the bug it is supposed to fix.

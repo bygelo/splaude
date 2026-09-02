@@ -178,7 +178,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         hasNotedDrift = false
         watchForSubmit()
 
-        Diagnostic.session("record — \(FocusProbe.frontmostApp) / \(focus.label) → \(isTypingLive ? "live typing" : "paste at end")\(anchor == nil ? "" : ", anchored")")
+        // The bundle identifier is in here for one reason: a remote client the
+        // paste-only list has never heard of delivers the take as a run of `a`,
+        // and the only cure is adding its identifier to Settings. Printing it
+        // on every take is what turns that from a guess into a copy and paste.
+        Diagnostic.session("record — \(FocusProbe.frontmostApp) (\(bundle ?? "no bundle id")) / \(focus.label) → \(isTypingLive ? "live typing" : "paste at end")\(anchor == nil ? "" : ", anchored")")
 
         // Live typing going quiet with no explanation is exactly the failure
         // mode this app logs against, so say which app turned it off and why.

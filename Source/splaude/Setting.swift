@@ -89,9 +89,19 @@ enum Setting {
         "com.teamviewer.TeamViewer",
         "com.philandro.anydesk",
         "com.carriez.RustDesk",
+        "com.nomachine.nxplayer",
+        "com.p5sys.jump.mac.viewer",     // Jump Desktop
+        "com.utmapp.UTM",
+        "org.virtualbox.app.VirtualBoxVM",
     ]
 
     /// Apps the user added. Kept separate so the built-in list is never lost.
+    ///
+    /// The list above cannot be complete — a client it has not heard of costs
+    /// the user a take, delivered as a run of `a` — and the identifier that
+    /// would fix it is not something anyone can guess from the outside. So
+    /// every take names its destination's bundle identifier in the log whether
+    /// or not it matched, and this is where that identifier goes.
     static var customPasteOnlyApp: [String] {
         get { store.stringArray(forKey: "pasteOnlyApp") ?? [] }
         set { write(newValue, "pasteOnlyApp") }

@@ -62,6 +62,29 @@ binding safely, and the reason is worth reading before you change it
 ([CHANGELOG](CHANGELOG.md)). `splaude.exe --check` reports credential,
 capability, quota and settings state without opening a window or a microphone.
 
+Everything the Mac app offers is here: a settings window with the same four
+groups, the floating mic button, Start Dictation in the menu for when the
+binding is being swallowed, and a credential warning that puts its own fix on
+the clipboard when clicked. `splaude.exe --settings` opens the window on its
+own — which is the way in when the tray icon is still hidden in the `^`
+overflow, and when the thing you need to change is the binding itself.
+
+Starting splaude while it is already running raises the copy you have rather
+than failing quietly, and two commands talk to it:
+
+```sh
+splaude --toggle    # start a take, or end the one running
+splaude --cancel    # end the take and throw the words away
+```
+
+Both exist because the hotkey is not always deliverable. A full-screen
+remote-desktop client takes the keyboard before any local application sees it,
+so bind `--toggle` to whatever *can* reach you — a launcher, a Stream Deck,
+AutoHotkey, or the remote machine itself.
+
+Both windows are hand-written Win32 rather than a widget toolkit, so the
+download is still one unpacked `.exe` with nothing to install.
+
 ## Updating
 
 splaude tells you when a newer version exists. It asks GitHub's release API
@@ -115,6 +138,8 @@ System Settings › General › Login Items.
 | `Source/`, `Package.swift`, `Makefile` | The macOS app — this is what ships |
 | `Crate/`, `Cargo.toml` | A Rust workspace targeting Windows, Linux and macOS. Builds the `splaude` binary that ships on Windows — see [docs/PORTING.md](docs/PORTING.md) |
 | `Script/` | Icon and banner renderers |
+| `Package/winget/` | The winget manifest, rendered per release by the workflow |
+| `ROADMAP.md`, `docs/roadmap-rejected.md` | What is next and how it will be judged, and what was turned down with the reason |
 
 `cargo test` runs the Rust workspace; it has no bearing on the macOS build,
 which is built with `make` as above.
@@ -123,10 +148,13 @@ which is built with `make` as above.
 
 | Gesture | Effect |
 | --- | --- |
-| Hold `⌥Space` | Dictate while held, insert on release |
-| Tap `⌥Space` | Latch recording on; tap again to stop and insert |
+| Hold `⌥Space` (`F9` on Windows) | Dictate while held, insert on release |
+| Tap it | Latch recording on; tap again to stop and insert |
 | Floating mic button | Click to start or stop. Drag to move; position is remembered |
 | Menu bar icon | Same toggle, plus a transcript preview you can click to copy |
+
+Every gesture works on both platforms. The one difference is the default
+binding, and [Windows](#windows) says why.
 
 The floating button is a non-activating panel that refuses key status, so
 clicking it cannot steal focus from the field you are dictating into — an
@@ -211,6 +239,58 @@ menu carries two probes and the app keeps a log at
 
 If a paste is refused the text is left on the clipboard, so a missing
 permission costs you a `⌘V` rather than the whole take.
+
+### Nothing happens when I press the key
+
+In order, because each is cheaper to check than the next:
+
+1. **`splaude --check`.** It reports the credential, whether this session can
+   register a hotkey and type at all, **whether a microphone exists**, and which
+   speech backend a take would use. No input device is the most common answer on
+   a machine that is remoted into, and no take can start without one.
+2. **Reveal Log.** A take that cannot start now says why there.
+3. **Test Paste**, which exercises keystroke delivery with no microphone,
+   network or credential involved.
+4. **Is the hotkey reaching splaude at all?** If holding it over a full-screen
+   remote-desktop session produces no tone and no `record` line, that client has
+   the keyboard. Use `splaude --toggle`, the tray's Start Dictation, or the
+   floating button.
+
+### Dictating into Remote Desktop, a VM or a screen share
+
+A remote window is not an app that reads our keystrokes — it is a translator.
+It watches the keyboard the way hardware does, re-encodes what it sees into
+scancodes, and ships those down the wire, so everything that makes live typing
+layout-proof is invisible to it. splaude therefore switches delivery for these
+apps: the take is buffered, put on the clipboard, and pasted with a `⌘` posted
+as a real key event of its own, paced so the far end cannot sample between the
+modifier and the `V`. Three symptoms mean the switch did not happen:
+
+- **The take arrives as a run of `a`.** Live typing was used. The client is not
+  on the paste-only list.
+- **The take arrives as a single `v`.** The chord went out with `⌘` as a flag
+  and no key event — fixed after 0.2.0; older builds do this in every remote
+  window.
+- **Nothing arrives, or the previous clipboard does.** The clipboard was handed
+  back before the redirection had carried it across. Also fixed after 0.2.0.
+
+The list is bundle identifiers, and it cannot be complete. Every take now names
+its destination in the log —
+
+```
+record — Windows App (com.microsoft.rdc.macos) / text field → paste at end
+```
+
+— so a client that is missing can be added by identifier under Settings ›
+Dictation › paste-only apps, or with
+`defaults write com.bygelo.splaude pasteOnlyApp -array-add "com.example.client"`.
+
+One thing splaude cannot fix from its side: a remote client set to send **all**
+keyboard shortcuts to the remote machine, which most do by default in full
+screen, swallows the push-to-talk hotkey before any app on this machine sees
+it. If holding the hotkey over a full-screen session does nothing at all — no
+tone, no `record` line in the log — that is what happened. Run the session
+windowed, or point the client's keyboard preference back at this computer.
 
 ### The credential expires
 
@@ -305,6 +385,39 @@ than types at — remote desktop and VM clients, which read the keycode off a
 synthetic keystroke instead of the character it carries and would otherwise
 turn a whole take into a run of `a`.
 
+`bufferOnlyApp` is the same shape for a different problem: applications where
+typing *works* and is still a bad idea. A terminal running a full-screen program
+reads characters as commands, and live typing revises itself with backspaces.
+Naming one here buffers the take and pastes it at the end, without turning live
+typing off everywhere else.
+
+`replacement` corrects words the recogniser gets wrong the same way every time:
+
+```json
+"replacement": { "Cloud Code": "Claude Code", "super base": "Supabase" }
+```
+
+Keyterms bias what it *hears*; this fixes what it decided. The longest matching
+rule wins, and replaced text is never re-examined, so a rule cannot loop.
+
+`latchTimeoutSecond` ends a *latched* take after that many seconds of silence —
+30 by default, 0 never. Only latched takes: one you are holding ends when you
+let go, so it cannot be forgotten.
+
+`speechBackend` and `apiKey` choose where speech goes. The default,
+`"anthropic"`, is the endpoint described above and needs no key. Setting it to
+`"deepgram"` with a key of your own sends audio to Deepgram directly, billed to
+you — which is the answer to the caveat at the top of this file, and the reason
+it is worth having before it is needed:
+
+```json
+"speechBackend": "deepgram",
+"apiKey": "your-deepgram-key"
+```
+
+`splaude --check` prints which backend a take would use, and says so plainly if
+the backend is set to Deepgram with no key.
+
 Live typing also sets `forward_interims=typed` on the connection, which asks
 the server to punctuate and case interim results as they stream rather than
 only at utterance boundaries. The extension hides the same flag behind
@@ -322,6 +435,7 @@ AudioCapture          AVAudioEngine tap → AVAudioConverter → 16 kHz mono int
 AnthropicSpeechBackend WebSocket, keepalive every 8 s, CloseStream on finish
 TranscriptBuffer      interim frames replace, endpoint frames commit
 TextInserter          pasteboard snapshot → set → ⌘V via CGEvent → restore
+                      (remote clients: ⌘ posted as its own event, paced, held)
 Hotkey                Carbon RegisterEventHotKey, press + release
 ```
 

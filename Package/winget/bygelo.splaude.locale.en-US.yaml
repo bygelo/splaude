@@ -1,0 +1,32 @@
+# What winget shows a person searching for this.
+PackageIdentifier: bygelo.splaude
+PackageVersion: "{{VERSION}}"
+PackageLocale: en-US
+Publisher: bygelo
+PublisherUrl: https://github.com/bygelo
+PublisherSupportUrl: https://github.com/bygelo/splaude/issues
+PackageName: splaude
+PackageUrl: https://github.com/bygelo/splaude
+License: MIT
+LicenseUrl: https://github.com/bygelo/splaude/blob/main/LICENSE
+ShortDescription: Push-to-talk dictation that types at your cursor.
+Description: |-
+  Hold a hotkey, talk, release — the text lands at your cursor in whatever app
+  you were typing in, and it appears as you speak rather than after you stop.
+
+  splaude authenticates with the Claude Code OAuth credential already on the
+  machine, so if you have run `claude` once there is nothing else to set up.
+  The speech endpoint it uses is undocumented and internal to Anthropic, and
+  splaude is a third-party client of it rather than an Anthropic product; read
+  the caveat in the README before installing. A Deepgram key of your own can be
+  used instead.
+Moniker: splaude
+Tags:
+  - dictation
+  - speech-to-text
+  - voice
+  - transcription
+  - accessibility
+ReleaseNotesUrl: https://github.com/bygelo/splaude/releases/tag/v{{VERSION}}
+ManifestType: defaultLocale
+ManifestVersion: 1.6.0

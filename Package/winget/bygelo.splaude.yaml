@@ -1,0 +1,7 @@
+# The version manifest: the one file that says which version this directory is.
+# {{VERSION}} is filled in by the release workflow.
+PackageIdentifier: bygelo.splaude
+PackageVersion: "{{VERSION}}"
+DefaultLocale: en-US
+ManifestType: version
+ManifestVersion: 1.6.0

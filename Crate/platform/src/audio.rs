@@ -33,6 +33,27 @@ use splaude_core::speech::SpeechAudioFormat;
 
 use crate::resample::{level_of, smooth, Resampler};
 
+/// The default input device's name, or `None` when there is not one.
+///
+/// Asked for by the settings window and by `--check`, and worth its own
+/// function rather than being inferred from a failed take: "no input device
+/// available" is the most common way dictation does nothing on Windows, and the
+/// causes are mundane — a Remote Desktop session with no audio redirected, a
+/// headset that is output-only, a microphone switched off in Windows privacy
+/// settings. All of them are visible here before a key is ever pressed.
+///
+/// Opens nothing and records nothing: naming the device does not start a
+/// stream, so this is safe to call from a window being drawn.
+pub fn default_input_name() -> Option<String> {
+    // `to_string`, not `description()`: cpal 0.18 replaced the old `name()`
+    // with a structured description and documents `Display` as the way to ask
+    // for just the name — which is the whole of what is wanted here, and does
+    // not fail when a device is present but its metadata is not readable.
+    cpal::default_host()
+        .default_input_device()
+        .map(|device| device.to_string())
+}
+
 /// How long the worker sleeps between stop checks. Short enough that a key-up
 /// releases the microphone before the user notices, long enough not to spin.
 const STOP_POLL: Duration = Duration::from_millis(20);
@@ -335,6 +356,14 @@ fn raise_peak(peak: &AtomicU32, incoming: f32) {
 mod test {
     use super::*;
     use cpal::SupportedBufferSize;
+
+    /// CI has no sound card and a Remote Desktop session may have no microphone
+    /// at all, so the only thing that can be asserted is that asking is not
+    /// itself a failure.
+    #[test]
+    fn naming_the_input_device_answers_rather_than_panicking() {
+        let _ = default_input_name();
+    }
 
     fn range(
         channels: u16,

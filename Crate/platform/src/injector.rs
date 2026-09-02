@@ -106,14 +106,44 @@ const PASTE_KEY: Key = Key::Other(9);
 const PASTE_KEY: Key = Key::Other(0x56);
 
 /// How long the focused application gets to read the clipboard before the
-/// previous contents go back. The same 0.35 s `TextInserter.swift` waits, and
-/// for the same reason: the paste is asynchronous — the keystroke has only been
-/// posted, not consumed — and restoring too early hands the app the *old*
-/// clipboard to paste. The injector runs on a thread of its own whose only job
-/// is delivery, and the take is over by the time this runs, so blocking here
-/// costs nothing the user can perceive.
+/// previous contents go back.
+///
+/// Two seconds rather than the 0.35 s `TextInserter.swift` waits for a local
+/// paste, because this path is never local: [`Injector::paste`] is reached only
+/// for an application on the keycode list, and every entry on that list is a
+/// remote-desktop, VM or screen-sharing client. Their clipboard is redirected,
+/// which makes reading it three hops instead of one — the client has to notice
+/// the local clipboard changed, announce the new format list over the wire, and
+/// only then does the application on the far end ask for the bytes, well after
+/// the `Ctrl+V` was delivered. Restore on the local schedule and the answer to
+/// that request is the user's *old* clipboard, which is the failure that reads
+/// as nothing having happened: the paste fires and either nothing appears or
+/// whatever was copied before the take does.
+///
+/// The injector runs on a thread of its own whose only job is delivery, and the
+/// take is over by the time this runs, so blocking here costs nothing the user
+/// can perceive — but it does hold their clipboard for those two seconds, which
+/// is the price of the take arriving at all.
 #[cfg(not(target_os = "linux"))]
-const CLIPBOARD_SETTLE_MILLIS: u64 = 350;
+const CLIPBOARD_SETTLE_MILLIS: u64 = 2_000;
+
+/// How long the clipboard is left alone *before* the chord goes out. The same
+/// redirection seen from the other end: the far side cannot paste a payload the
+/// client has not announced yet, so the paste has to be later than the copy by
+/// more than a frame.
+#[cfg(not(target_os = "linux"))]
+const CLIPBOARD_LEAD_MILLIS: u64 = 250;
+
+/// Milliseconds between the events of the paste chord.
+///
+/// Zero is right for a native application — `SendInput` queues the events in
+/// order and the focused window is handed them as posted. A remote client is
+/// sampling instead: it reads keyboard state, encodes a scancode and ships it,
+/// so events posted inside the same millisecond can be coalesced or re-encoded
+/// out of order, and a `Ctrl` that arrives after its `V` is not a paste — it is
+/// a lone `v` typed into the far end, on top of whatever the user had selected.
+#[cfg(not(target_os = "linux"))]
+const CHORD_GAP_MILLIS: u64 = 12;
 
 pub struct Injector {
     enigo: Enigo,
@@ -183,7 +213,29 @@ impl Injector {
             return Ok(());
         }
 
-        let chunk = chunk_char(&clean, CHUNK_CHAR);
+        // Windows only, and not a nicety — see `type_break`. Every other
+        // platform carries a newline in the payload like any other character.
+        #[cfg(windows)]
+        {
+            // Joined rather than typed with a break between them — see
+            // `BREAK_REPLACEMENT` for why there is no break to type.
+            let joined = line_run(&clean).join(Self::BREAK_REPLACEMENT);
+            self.type_run(&joined, interval_micros)
+        }
+
+        #[cfg(not(windows))]
+        {
+            self.type_run(&clean, interval_micros)
+        }
+    }
+
+    /// Types a run with no line break in it.
+    fn type_run(&mut self, text: &str, interval_micros: u32) -> Result<()> {
+        if text.is_empty() {
+            return Ok(());
+        }
+
+        let chunk = chunk_char(text, CHUNK_CHAR);
         let last = chunk.len().saturating_sub(1);
 
         for (index, part) in chunk.iter().enumerate() {
@@ -199,6 +251,33 @@ impl Injector {
 
         Ok(())
     }
+
+    /// What goes out in place of a line break, and why it is not a line break.
+    ///
+    /// The hazard is documented and real: `Keyboard::text` on Windows
+    /// special-cases `'\n'` into a `VK_RETURN` click, and a real Return in a
+    /// chat box, a search field or a terminal *submits* — so a transcript that
+    /// happened to contain a newline would send somebody's half-written message
+    /// and then keep dictating into whatever came next.
+    ///
+    /// The obvious fix is to carry the break as a unicode payload on virtual
+    /// key zero, the way every other character travels and the way
+    /// `LiveTyper.swift` does it on macOS. **That was tried, and it does not
+    /// work.** Windows translates an injected `U+000A` back into the Return key
+    /// inside the keyboard layer, below anything this process controls: the
+    /// target window receives `WM_CHAR` for CR *and* LF, plus a `WM_KEYDOWN`
+    /// carrying `VK_RETURN`. `tests/injection.rs` measured exactly that, which
+    /// is the entire reason that test exists — the first fix here looked
+    /// correct, read correctly, and submitted the message anyway.
+    ///
+    /// So the break is not sent. A space is, which loses the line break and
+    /// keeps the words, and that trade is not close: a paragraph that arrives
+    /// as one line is a cosmetic loss the user can see and fix, while a message
+    /// sent before it was finished cannot be taken back. Speech transcripts
+    /// almost never contain a newline in the first place — this path exists for
+    /// the case that they do, not because it is common.
+    #[cfg(windows)]
+    const BREAK_REPLACEMENT: &'static str = " ";
 
     pub fn backspace(&mut self, count: usize, interval_micros: u32) -> Result<()> {
         for index in 0..count {
@@ -246,6 +325,10 @@ impl Injector {
         clipboard
             .set_text(text)
             .context("could not put the take on the clipboard")?;
+
+        // See CLIPBOARD_LEAD_MILLIS: the chord must not overtake the clipboard
+        // redirection it depends on.
+        thread::sleep(Duration::from_millis(CLIPBOARD_LEAD_MILLIS));
 
         let struck = self.paste_chord();
 
@@ -304,10 +387,17 @@ impl Injector {
             .key(PASTE_MODIFIER, Direction::Press)
             .context("could not hold the paste modifier")?;
 
+        // The modifier must be observably down before the key is struck, and
+        // observably still down after — see CHORD_GAP_MILLIS. A client that
+        // samples between the two sends a bare `v`.
+        thread::sleep(Duration::from_millis(CHORD_GAP_MILLIS));
+
         let struck = self
             .enigo
             .key(PASTE_KEY, Direction::Click)
             .context("could not send the paste chord to the focused application");
+
+        thread::sleep(Duration::from_millis(CHORD_GAP_MILLIS));
 
         // Released unconditionally. A modifier left stuck down after a failed
         // keystroke turns the user's next real keypress into a shortcut, which
@@ -404,6 +494,36 @@ fn binding_modifier(binding: splaude_core::Hotkey) -> Vec<Key> {
     .filter(|(flag, _)| binding.modifier.contains(*flag))
     .map(|(_, key)| key)
     .collect()
+}
+
+/// Splits text into the runs between its line breaks, treating `\r\n` as one
+/// break rather than two.
+///
+/// Pure, and separated from the typing for the usual reason in this module: the
+/// rule about what counts as a break is the part that can be wrong, and it has
+/// to be checkable without a keyboard, a window server or a focused
+/// application.
+///
+/// The output always has at least one element, so a caller that types the first
+/// run and then a break before each of the rest never emits a leading break —
+/// which would drop the user's sentence onto the line below where they were.
+#[cfg(windows)]
+fn line_run(text: &str) -> Vec<&str> {
+    let mut run = Vec::new();
+    let mut rest = text;
+
+    while let Some(at) = rest.find(['\n', '\r']) {
+        let (line, tail) = rest.split_at(at);
+        run.push(line);
+        // Both separators are one byte, so slicing past either cannot land
+        // inside a character.
+        rest = tail
+            .strip_prefix("\r\n")
+            .unwrap_or_else(|| tail.get(1..).unwrap_or(""));
+    }
+
+    run.push(rest);
+    run
 }
 
 fn sleep_micros(micros: u32) {
@@ -513,6 +633,59 @@ mod test {
                     assert!(MODIFIER.contains(&key), "{key:?} from {text}");
                 }
             }
+        }
+    }
+
+    /// The newline hazard, checked where it can be checked: nothing here types
+    /// anything, because the bug is in deciding what a break is, not in sending
+    /// one.
+    #[cfg(windows)]
+    mod break_splitting {
+        use super::*;
+
+        #[test]
+        fn text_with_no_break_is_one_run() {
+            assert_eq!(line_run("hello there"), vec!["hello there"]);
+        }
+
+        #[test]
+        fn a_newline_separates_two_runs() {
+            assert_eq!(line_run("one\ntwo"), vec!["one", "two"]);
+        }
+
+        /// The whole point: the caller types run 0, then a break before each
+        /// later run. Two runs means exactly one break — so both words arrive
+        /// and nothing is submitted, once or twice.
+        #[test]
+        fn crlf_is_one_break_and_not_two() {
+            assert_eq!(line_run("one\r\ntwo"), vec!["one", "two"]);
+            assert_eq!(line_run("one\rtwo"), vec!["one", "two"]);
+        }
+
+        #[test]
+        fn consecutive_breaks_keep_the_empty_run_between_them() {
+            // A blank line is a break the user asked for twice, and dropping it
+            // would silently reflow their paragraph.
+            assert_eq!(line_run("one\n\ntwo"), vec!["one", "", "two"]);
+        }
+
+        #[test]
+        fn a_leading_or_trailing_break_is_kept_as_an_empty_run() {
+            assert_eq!(line_run("\nafter"), vec!["", "after"]);
+            assert_eq!(line_run("before\n"), vec!["before", ""]);
+        }
+
+        #[test]
+        fn the_split_never_yields_an_empty_vector() {
+            // The caller indexes run 0 unconditionally.
+            assert!(!line_run("").is_empty());
+            assert_eq!(line_run(""), vec![""]);
+        }
+
+        #[test]
+        fn multibyte_runs_survive_the_split() {
+            let text = "héllo\nwörld\r\n日本語";
+            assert_eq!(line_run(text), vec!["héllo", "wörld", "日本語"]);
         }
     }
 

@@ -36,9 +36,12 @@ pub use crate::icon::{step_of, Mood};
 // across menu rebuilds so a click always means the same thing.
 const QUIT: &str = "splaude:quit";
 const TRANSCRIPT: &str = "splaude:transcript";
+const DICTATE: &str = "splaude:dictate";
+const CREDENTIAL: &str = "splaude:credential";
 const REVEAL_LOG: &str = "splaude:reveal-log";
 const AUTOSTART: &str = "splaude:autostart";
 const TEST_PASTE: &str = "splaude:test-paste";
+const OPEN_SETTING: &str = "splaude:open-setting";
 const EDIT_SETTING: &str = "splaude:edit-setting";
 const RELOAD_SETTING: &str = "splaude:reload-setting";
 const UPDATE: &str = "splaude:update";
@@ -63,8 +66,24 @@ pub enum Ask {
     CopyTranscript,
     RevealLog,
     ToggleAutostart,
+    /// Start or stop a take from the menu, as `Start Dictation` does in the
+    /// Swift build's menu bar.
+    ///
+    /// Not a duplicate of the hotkey. A binding can be refused by the OS, taken
+    /// by another app, or swallowed before it arrives — a full-screen remote
+    /// desktop does exactly that — and until now the tray could say the hotkey
+    /// was `F9` while offering no way to dictate when `F9` never came. It is
+    /// also the honest answer for a machine where the user has not yet worked
+    /// out what their binding is.
+    ToggleDictation,
+    /// The credential warning was clicked. It is the one line in the menu that
+    /// names a problem with a command-shaped fix, so clicking it puts that
+    /// command on the clipboard — `showCredentialHelp` in `AppDelegate.swift`.
+    CredentialHelp,
     /// Type a known string into whatever has focus, exercising injection alone.
     TestPaste,
+    /// Open the settings window.
+    OpenSetting,
     /// Open the settings file in whatever edits JSON on this machine.
     EditSetting,
     /// Re-read the settings file and apply what can be applied live.
@@ -136,6 +155,13 @@ impl Tray {
         if self.mood == mood {
             return;
         }
+        // The menu carries Start/Stop Dictation, so it goes stale when a take
+        // begins or ends — but *only* then. A level step is also a mood change,
+        // arriving as fast as the microphone produces buffers, and rebuilding
+        // the menu for each of those would throw away and re-make every item
+        // hundreds of times a take for a label that did not change.
+        let flipped = self.is_recording() != matches!(mood, Mood::Recording(_));
+
         self.mood = mood;
 
         // Both failures are cosmetic. A stale icon is not worth interrupting a
@@ -144,6 +170,10 @@ impl Tray {
             let _ = self.icon.set_icon(Some(icon));
         }
         let _ = self.icon.set_tooltip(Some(tooltip(mood, &self.hotkey)));
+
+        if flipped {
+            self.redraw_menu();
+        }
     }
 
     /// Whether a take is currently on the air, so a level arriving late — the
@@ -257,8 +287,12 @@ impl Tray {
         // rather than something discovered when a take fails. Disabled: it is
         // a warning, and an enabled item that does nothing when clicked reads
         // as broken.
+        // Enabled, unlike the note below it, because this one has somewhere to
+        // go: the fix is `claude` in a terminal, and a click puts that on the
+        // clipboard rather than asking the user to retype it from a menu they
+        // have just dismissed.
         if let Some(line) = &self.health {
-            append(&menu, &MenuItem::new(line, false, None))?;
+            append(&menu, &MenuItem::with_id(CREDENTIAL, line, true, None))?;
         }
         // Beside the credential warning rather than beside the settings items:
         // both are the same kind of statement — something the app needs is not
@@ -291,6 +325,21 @@ impl Tray {
             )?;
         }
 
+        // Above the label that describes the hotkey, because it is the one way
+        // to dictate that does not depend on the hotkey arriving at all.
+        append(
+            &menu,
+            &MenuItem::with_id(
+                DICTATE,
+                if self.is_recording() {
+                    "Stop Dictation"
+                } else {
+                    "Start Dictation"
+                },
+                true,
+                None,
+            ),
+        )?;
         // Disabled on purpose — it is a label.
         append(
             &menu,
@@ -317,6 +366,14 @@ impl Tray {
         // The settings pair together, above the diagnostics: the file is the
         // interface, so opening it and re-reading it are one gesture in two
         // halves.
+        append(
+            &menu,
+            &MenuItem::with_id(OPEN_SETTING, "Settings…", true, None),
+        )?;
+        // Kept beside the window rather than replaced by it. The file is still
+        // the only way to reach what no window offers — the paste-only app list
+        // — and the only thing that can show a user what is wrong with a file
+        // the window refuses to open over.
         append(
             &menu,
             &MenuItem::with_id(EDIT_SETTING, "Edit Settings…", true, None),
@@ -368,9 +425,12 @@ pub fn ask(id: &MenuId) -> Ask {
         REVEAL_LOG => Ask::RevealLog,
         AUTOSTART => Ask::ToggleAutostart,
         TEST_PASTE => Ask::TestPaste,
+        OPEN_SETTING => Ask::OpenSetting,
         EDIT_SETTING => Ask::EditSetting,
         RELOAD_SETTING => Ask::ReloadSetting,
         UPDATE => Ask::Update,
+        DICTATE => Ask::ToggleDictation,
+        CREDENTIAL => Ask::CredentialHelp,
         _ => Ask::Ignore,
     }
 }
@@ -617,9 +677,12 @@ mod test {
         assert_eq!(ask(&MenuId::new(REVEAL_LOG)), Ask::RevealLog);
         assert_eq!(ask(&MenuId::new(AUTOSTART)), Ask::ToggleAutostart);
         assert_eq!(ask(&MenuId::new(TEST_PASTE)), Ask::TestPaste);
+        assert_eq!(ask(&MenuId::new(OPEN_SETTING)), Ask::OpenSetting);
         assert_eq!(ask(&MenuId::new(EDIT_SETTING)), Ask::EditSetting);
         assert_eq!(ask(&MenuId::new(RELOAD_SETTING)), Ask::ReloadSetting);
         assert_eq!(ask(&MenuId::new(UPDATE)), Ask::Update);
+        assert_eq!(ask(&MenuId::new(DICTATE)), Ask::ToggleDictation);
+        assert_eq!(ask(&MenuId::new(CREDENTIAL)), Ask::CredentialHelp);
     }
 
     fn published(major: u32, minor: u32, patch: u32) -> update::Release {

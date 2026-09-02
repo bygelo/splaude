@@ -291,6 +291,24 @@ pub struct Setting {
     pub custom_keyterm: Vec<String>,
     pub use_builtin_keyterm: bool,
     pub language: String,
+    /// Which speech provider a take goes to: `anthropic` (the default) or
+    /// `deepgram`.
+    ///
+    /// The reason this is a setting rather than a build choice is in
+    /// `speech/deepgram.rs`: the default endpoint is undocumented and
+    /// unsanctioned, and the README's answer to "what if it goes away" was an
+    /// abstraction nobody had ever used. This is the switch that makes that
+    /// answer real.
+    pub speech_backend: String,
+    /// The provider key, for every backend that is not the default one. Empty
+    /// for `anthropic`, which authenticates with the Claude Code credential
+    /// already on the machine and needs nothing here.
+    pub api_key: String,
+    /// Literal corrections applied to the transcript before it is typed, for a
+    /// word the recogniser spells wrong the same way every time. Keyterms bias
+    /// what it hears; this fixes what it decided. See
+    /// [`crate::replacement::apply`].
+    pub replacement: crate::replacement::Rule,
 
     // Output
     /// Types into the focused app as you speak, rewriting revised words.
@@ -306,11 +324,32 @@ pub struct Setting {
     /// search field the next words would land somewhere you cannot see. Worth
     /// turning off when dictating prose, where Return is just a new paragraph.
     pub stop_on_return: bool,
+    /// Seconds of silence after which a *latched* take ends by itself. Zero
+    /// never ends one.
+    ///
+    /// Only latched takes, and that is the whole design. A held take ends when
+    /// the key comes up, so it cannot be forgotten; a latched one runs until
+    /// something stops it, and the thing that usually stops it is the user
+    /// noticing much later that the icon is still red. The tone at each end
+    /// exists to make that state audible, which is an admission it is easy to
+    /// reach.
+    pub latch_timeout_second: u32,
     /// Executables the user added to [`BUILTIN_KEYCODE_APP`]. Kept separate for
     /// the same reason `custom_keyterm` is: adding one must never cost the
     /// built-ins.
     pub custom_keycode_app: Vec<String>,
     pub use_builtin_keycode_app: bool,
+    /// Applications that get the whole take pasted at the end rather than typed
+    /// as you speak, even though typing into them would work.
+    ///
+    /// Distinct from the keycode list above, which is about applications where
+    /// typing is *broken*. This one is about applications where it is merely
+    /// unwise: a terminal running a full-screen program reads characters as
+    /// commands, and live typing revises itself with backspaces. The focus
+    /// guard already refuses to claim it can tell a terminal's state — see
+    /// `focus.rs` — so this is the user answering the question the guard
+    /// honestly cannot.
+    pub buffer_only_app: Vec<String>,
     /// Pin a take to the field it started in, rather than following focus.
     ///
     /// Off means keystrokes go wherever focus is when they are posted, so
@@ -338,12 +377,30 @@ impl Default for Setting {
             custom_keyterm: Vec::new(),
             use_builtin_keyterm: true,
             language: "en".into(),
+            speech_backend: "anthropic".into(),
+            api_key: String::new(),
+            // Empty, and it stays empty until someone hits a word the
+            // recogniser gets wrong for them. There is no useful default here:
+            // a shipped correction list would be this project deciding what
+            // other people's proper nouns are.
+            replacement: crate::replacement::Rule::new(),
             live_typing: true,
             typing_interval: 1_200,
             guard_focus: true,
             stop_on_return: true,
+            // Thirty seconds: long enough that no pause for thought reaches it
+            // — the longest silence inside a real dictation is a few seconds —
+            // and short enough that a microphone left open is not left open for
+            // the afternoon. Set it to 0 to dictate with long silences on
+            // purpose.
+            latch_timeout_second: 30,
             custom_keycode_app: Vec::new(),
             use_builtin_keycode_app: true,
+            // Empty: nothing is buffered by default. A terminal is the obvious
+            // candidate, but shipping one would decide for every user that
+            // dictating into their shell is a thing they do not want to see
+            // happen live.
+            buffer_only_app: Vec::new(),
             anchor_input: true,
             show_floating_button: true,
             floating_button_point: None,
@@ -360,6 +417,18 @@ impl Default for Setting {
 /// as often as not and both spellings mean the same process. Case is left to the
 /// caller's `eq_ignore_ascii_case`, which is the right comparison on Windows —
 /// `MSTSC.EXE` and `mstsc.exe` are one file there.
+/// Whether `executable` names one of `known`, by the rules both application
+/// lists share: leaf name, extension ignored, case-insensitive.
+fn matches(known: &[String], executable: &str) -> bool {
+    let name = bare_executable(executable);
+    if name.is_empty() {
+        return false;
+    }
+    known
+        .iter()
+        .any(|entry| bare_executable(entry).eq_ignore_ascii_case(name))
+}
+
 fn bare_executable(name: &str) -> &str {
     let name = name.trim();
     match name.len().checked_sub(4) {
@@ -405,13 +474,16 @@ impl Setting {
     /// Pure over the name, so the whole carve-out is testable with no desktop,
     /// no focused window and no remote-desktop session.
     pub fn is_keycode_app(&self, executable: &str) -> bool {
-        let name = bare_executable(executable);
-        if name.is_empty() {
-            return false;
-        }
-        self.keycode_app()
-            .iter()
-            .any(|known| bare_executable(known).eq_ignore_ascii_case(name))
+        matches(&self.keycode_app(), executable)
+    }
+
+    /// Whether this application should be buffered rather than typed into live.
+    ///
+    /// Matched exactly like the keycode list — same names, same
+    /// case-insensitivity — because a user who has written one list should not
+    /// have to learn a second set of rules to write the other.
+    pub fn is_buffer_only_app(&self, executable: &str) -> bool {
+        matches(&self.buffer_only_app, executable)
     }
 
     /// `%APPDATA%\splaude\setting.json`, `~/Library/Application Support/…`,
@@ -498,6 +570,9 @@ impl Setting {
                 self.use_builtin_keyterm != other.use_builtin_keyterm,
             ),
             ("language", self.language != other.language),
+            ("speechBackend", self.speech_backend != other.speech_backend),
+            ("apiKey", self.api_key != other.api_key),
+            ("replacement", self.replacement != other.replacement),
             ("liveTyping", self.live_typing != other.live_typing),
             (
                 "typingInterval",
@@ -506,12 +581,20 @@ impl Setting {
             ("guardFocus", self.guard_focus != other.guard_focus),
             ("stopOnReturn", self.stop_on_return != other.stop_on_return),
             (
+                "latchTimeoutSecond",
+                self.latch_timeout_second != other.latch_timeout_second,
+            ),
+            (
                 "customKeycodeApp",
                 self.custom_keycode_app != other.custom_keycode_app,
             ),
             (
                 "useBuiltinKeycodeApp",
                 self.use_builtin_keycode_app != other.use_builtin_keycode_app,
+            ),
+            (
+                "bufferOnlyApp",
+                self.buffer_only_app != other.buffer_only_app,
             ),
             ("anchorInput", self.anchor_input != other.anchor_input),
             (
@@ -734,6 +817,7 @@ mod test {
         let setting = Setting {
             custom_keycode_app: vec!["Ericom.exe".into()],
             use_builtin_keycode_app: false,
+            buffer_only_app: vec!["WindowsTerminal.exe".into()],
             ..Setting::default()
         };
         assert_eq!(setting.keycode_app(), vec!["Ericom.exe".to_string()]);
@@ -826,6 +910,50 @@ mod test {
         assert_eq!(setting.typing_interval, TYPING_INTERVAL_FLOOR);
     }
 
+    /// The buffer-only list is a second, independent answer to a different
+    /// question, and the pair must not bleed into one another.
+    #[test]
+    fn the_two_application_lists_are_independent() {
+        let setting = Setting {
+            buffer_only_app: vec!["WindowsTerminal.exe".into()],
+            ..Setting::default()
+        };
+
+        assert!(setting.is_buffer_only_app("WindowsTerminal.exe"));
+        // Buffering a terminal must not make it a keycode application, which
+        // would silently switch it to a clipboard paste.
+        assert!(!setting.is_keycode_app("WindowsTerminal.exe"));
+        // And a remote desktop is still a keycode application without being on
+        // the buffer list.
+        assert!(setting.is_keycode_app("mstsc.exe"));
+        assert!(!setting.is_buffer_only_app("mstsc.exe"));
+    }
+
+    #[test]
+    fn the_buffer_list_matches_by_the_same_rules_as_the_keycode_list() {
+        let setting = Setting {
+            buffer_only_app: vec!["WindowsTerminal.exe".into()],
+            ..Setting::default()
+        };
+
+        for name in [
+            "WINDOWSTERMINAL.EXE",
+            "windowsterminal",
+            "  WindowsTerminal.exe  ",
+        ] {
+            assert!(setting.is_buffer_only_app(name), "{name}");
+        }
+        assert!(!setting.is_buffer_only_app("Terminal.exe"));
+        assert!(!setting.is_buffer_only_app(""));
+    }
+
+    #[test]
+    fn nothing_is_buffered_by_default() {
+        let setting = Setting::default();
+        assert!(!setting.is_buffer_only_app("WindowsTerminal.exe"));
+        assert!(setting.buffer_only_app.is_empty());
+    }
+
     #[test]
     fn an_unchanged_setting_has_no_difference() {
         let setting = Setting::default();
@@ -840,12 +968,19 @@ mod test {
             custom_keyterm: vec!["splaude".into()],
             use_builtin_keyterm: false,
             language: "ja".into(),
+            speech_backend: "deepgram".into(),
+            api_key: "secret".into(),
+            replacement: [("Cloud Code".to_string(), "Claude Code".to_string())]
+                .into_iter()
+                .collect(),
             live_typing: false,
             typing_interval: 2_000,
             guard_focus: false,
             stop_on_return: false,
+            latch_timeout_second: 0,
             custom_keycode_app: vec!["Ericom.exe".into()],
             use_builtin_keycode_app: false,
+            buffer_only_app: vec!["WindowsTerminal.exe".into()],
             anchor_input: false,
             show_floating_button: false,
             floating_button_point: Some(Point { x: 1.0, y: 2.0 }),
@@ -857,7 +992,7 @@ mod test {
         let named = Setting::default().difference(&other);
         assert_eq!(
             named.len(),
-            15,
+            20,
             "a field missing from difference is a field a reload changes in silence: {named:?}"
         );
         assert!(named.contains(&"hotkey".to_string()));

@@ -4,6 +4,8 @@
 //! had focus. This is the cross-platform build; macOS also ships a native Swift
 //! app (see `Source/`), which is what the released binaries are today.
 
+#[cfg(not(target_os = "linux"))]
+mod floating;
 /// Gated with `tray`, its only in-crate caller — Linux has no tray, so on Linux
 /// every item here would be dead code. `build.rs` reaches the same source by
 /// `include!` rather than through this module, so the `.ico` it renders and the
@@ -11,6 +13,8 @@
 #[cfg(not(target_os = "linux"))]
 mod icon;
 mod inject;
+#[cfg(not(target_os = "linux"))]
+mod setting_window;
 mod take;
 #[cfg(not(target_os = "linux"))]
 mod tray;
@@ -28,7 +32,7 @@ use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
 
 use splaude_core::credential::Store;
 use splaude_core::{diagnostic, quota, update, Setting};
-use splaude_platform::{autostart, focus, submit, Capability, HotkeyEdge, HotkeyListener};
+use splaude_platform::{autostart, control, focus, submit, Capability, HotkeyEdge, HotkeyListener};
 use take::{Report, Take};
 
 /// Longest press that still counts as a tap rather than a hold.
@@ -56,6 +60,23 @@ const TAP_CEILING: Duration = Duration::from_millis(400);
 #[cfg(not(target_os = "linux"))]
 const HEALTH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
 
+/// Below this share of full scale, nobody is talking.
+///
+/// Deliberately far under the meter's first step, which is a fifth of full
+/// scale: this is a noise floor, and a threshold set where the meter's steps
+/// are would call an ordinary quiet voice silence and end their take
+/// mid-sentence. Speech in the log of a real take peaks around 0.5.
+#[cfg(not(target_os = "linux"))]
+const SILENCE_LEVEL: f32 = 0.02;
+
+/// What a user with an expired or missing credential has to run.
+///
+/// splaude reads the credential Claude Code already wrote and never refreshes
+/// it, so the fix is always to make Claude Code write a fresh one. Same string
+/// the Swift build puts on the pasteboard.
+#[cfg(not(target_os = "linux"))]
+const CREDENTIAL_FIX: &str = "claude";
+
 const USAGE: &str = "\
 splaude — push-to-talk dictation
 
@@ -65,6 +86,9 @@ USAGE:
 OPTIONS:
     (none)      Run. Hold the hotkey to dictate, or tap it to latch on.
     --check     Report credential, permission and device state, then exit.
+    --settings  Open the settings window on its own, without dictating.
+    --toggle    Start or stop a take in the running splaude, then exit.
+    --cancel    Discard the take in progress, then exit.
     --help      Show this message.
     --version   Show the version.
 ";
@@ -75,7 +99,17 @@ OPTIONS:
 /// the platform picked, so neither touches state directly — they send one of
 /// these and let the loop, which owns the take, decide what it means.
 enum Wake {
-    Hotkey(HotkeyEdge),
+    /// A hotkey edge, and the instant it actually happened.
+    ///
+    /// The instant is carried rather than read when the loop gets to it, and
+    /// that is the whole of tap-versus-hold being correct. `Take::start` opens
+    /// a WebSocket on this thread, which takes a few hundred milliseconds
+    /// against a live endpoint — so the release of a genuine tap is not looked
+    /// at until well after [`TAP_CEILING`] has passed, and timing it on arrival
+    /// reads every tap during a slow handshake as a hold that ended. The take
+    /// then stops the instant it started, which from outside is a tap that
+    /// records nothing.
+    Hotkey(HotkeyEdge, Instant),
     /// Return was pressed — but not by us — while a take was on the air. From
     /// the hook in [`splaude_platform::submit`], which runs on this same
     /// thread and so must do nothing heavier than post this.
@@ -85,6 +119,10 @@ enum Wake {
     /// A change of input level step, from the audio callback.
     #[cfg(not(target_os = "linux"))]
     Level(u8),
+    /// The microphone crossed into or out of silence. Sent only on the
+    /// transition, so it costs nothing while somebody is talking.
+    #[cfg(not(target_os = "linux"))]
+    Silence(bool),
     /// One take's committed text, from the socket task.
     #[cfg(not(target_os = "linux"))]
     Transcript(String),
@@ -94,6 +132,22 @@ enum Wake {
     /// What an update check found, from the thread that made the request.
     #[cfg(not(target_os = "linux"))]
     Update(update::Reading),
+    /// Start or stop a take, asked for by something that is not the hotkey —
+    /// the tray's Start Dictation, or the floating button. Kept as one event
+    /// rather than two so both surfaces mean exactly the same thing.
+    #[cfg(not(target_os = "linux"))]
+    Gesture,
+    /// The floating button was dragged, and this is where it now sits.
+    #[cfg(not(target_os = "linux"))]
+    FloatingMoved(splaude_core::setting::Point),
+    /// A word from another splaude process — a second launch, or a `--toggle`
+    /// bound to something that can reach the keyboard when the hotkey cannot.
+    Control(control::Command),
+    /// The settings window wrote the file. Carries nothing: the file is the
+    /// message, and the loop re-reads it through the same `reload` a click on
+    /// *Reload Settings* runs.
+    #[cfg(not(target_os = "linux"))]
+    SettingSaved,
 }
 
 // MARK: - Take state
@@ -163,6 +217,59 @@ fn act(grip: Option<Grip>, edge: HotkeyEdge, now: Instant) -> Act {
     }
 }
 
+/// What the latch timeout wants doing, right now.
+#[cfg(not(target_os = "linux"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Latch {
+    /// The take has been latched and silent for long enough. End it.
+    Expired,
+    /// Not yet — sleep until exactly this instant rather than until the next
+    /// event, because a microphone left open in a silent room produces none.
+    WaitUntil(Instant),
+    /// Nothing is waiting on a clock.
+    Nothing,
+}
+
+/// Decides whether a latched take has been silent long enough to end itself.
+///
+/// Pure over the grip, the clock and the setting, for the same reason [`act`]
+/// is: it is a rule with four inputs that fires seconds after the event that
+/// armed it, and the only way to test it inside a real take is to sit in a
+/// silent room with a microphone — which the machine this was written on does
+/// not have.
+///
+/// A **held** take is never ended here, and that is the design rather than an
+/// oversight. The key is the contract: a hold ends when the user lets go, so a
+/// hold that outlived the timeout is somebody still pressing the button, not
+/// somebody who forgot. Only a latched take can be forgotten, because only a
+/// latched take has nothing holding it open.
+#[cfg(not(target_os = "linux"))]
+fn latch(
+    grip: Option<Grip>,
+    quiet_since: Option<Instant>,
+    timeout_second: u32,
+    now: Instant,
+) -> Latch {
+    if timeout_second == 0 {
+        return Latch::Nothing;
+    }
+
+    let (Some(Grip::Latched), Some(since)) = (grip, quiet_since) else {
+        return Latch::Nothing;
+    };
+
+    let timeout = Duration::from_secs(u64::from(timeout_second));
+
+    // Saturating: the instant is stamped by the audio callback on another
+    // thread, and a clock read there that lands microseconds ahead of this one
+    // would otherwise panic rather than merely be early.
+    if now.saturating_duration_since(since) >= timeout {
+        Latch::Expired
+    } else {
+        Latch::WaitUntil(since + timeout)
+    }
+}
+
 /// The take on the air, and everything that has to die with it.
 struct Running {
     take: Take,
@@ -177,6 +284,14 @@ struct Running {
 }
 
 impl Running {
+    /// Ends the take and throws its words away — see [`Take::discard`].
+    fn discard(self) {
+        let Self { take, submit, .. } = self;
+        #[allow(clippy::drop_non_drop)]
+        drop(submit);
+        take.discard();
+    }
+
     fn finish(self) {
         let Self { take, submit, .. } = self;
         // Before the take, not after: `Take::finish` waits on the microphone
@@ -195,6 +310,8 @@ impl Running {
 }
 
 fn main() -> Result<()> {
+    declare_dpi_awareness();
+
     let argument: Vec<String> = std::env::args().skip(1).collect();
 
     match argument.first().map(String::as_str) {
@@ -207,6 +324,25 @@ fn main() -> Result<()> {
         // does nothing, and the log holds a `start` line with nothing after it.
         None => run().inspect_err(|error| diagnostic::log("start", format!("{error:#}"))),
         Some("--check") => check(),
+
+        // The window on its own, with no hotkey, no microphone and no tray.
+        //
+        // Worth a flag of its own rather than only a menu item, because on
+        // Windows the menu it lives in can be genuinely unreachable: new
+        // notification-area icons are hidden behind the `^` overflow by
+        // default, and a user who has not dragged splaude out of it has no way
+        // to click anything. It is also what a user whose binding is being
+        // swallowed needs — the thing they have to change is the binding.
+        #[cfg(not(target_os = "linux"))]
+        Some("--settings") => settings(),
+
+        // Both hand a word to the instance that is already running and exit.
+        // They are the answer to a hotkey that cannot be delivered — a
+        // full-screen remote desktop takes the keyboard before any local app
+        // sees it — so anything that can run a command can still start a take.
+        Some("--toggle") => forward(control::Command::Toggle),
+        Some("--cancel") => forward(control::Command::Cancel),
+
         Some("--help" | "-h") => {
             print!("{USAGE}");
             Ok(())
@@ -241,6 +377,31 @@ fn run() -> Result<()> {
     // whoever ran it — on a CI runner most of all.
     diagnostic::to_file();
     diagnostic::session("start");
+
+    // Before anything is registered or opened. A second splaude would fail on
+    // the hotkey a moment later and exit with nothing on screen to say why —
+    // which is what double-clicking the icon while it was already running used
+    // to look like. Now the running copy is told to come to the front, and this
+    // process leaves without touching the microphone, the tray or the binding.
+    let channel = match control::claim() {
+        Ok(Some(channel)) => Some(channel),
+        Ok(None) => {
+            diagnostic::log("start", "splaude is already running — raising it instead");
+            let _ = control::send(control::Command::Show);
+            println!("splaude is already running.");
+            return Ok(());
+        }
+        // A channel that cannot be claimed for some other reason is not worth
+        // refusing to start over: the cost is a second instance nobody asked
+        // for, and the cost of the alternative is no dictation at all.
+        Err(error) => {
+            diagnostic::log(
+                "start",
+                format!("could not claim the control channel: {error:#} — carrying on without one"),
+            );
+            None
+        }
+    };
 
     // `mut` only on the platforms that have a tray: the launch-at-login item
     // and Reload Settings are what write a setting back.
@@ -292,7 +453,9 @@ fn run() -> Result<()> {
     let hotkey = HotkeyListener::new(
         setting.hotkey,
         Box::new(move |what| {
-            let _ = edge.send_event(Wake::Hotkey(what));
+            // Stamped here, in the callback the backend fires, which is as
+            // close to the physical key as this process can get.
+            let _ = edge.send_event(Wake::Hotkey(what, Instant::now()));
         }),
     )?;
 
@@ -353,6 +516,45 @@ fn run() -> Result<()> {
     #[cfg(not(target_os = "linux"))]
     let update_proxy = event_loop.create_proxy();
 
+    // How Start Dictation reaches the take. The menu does not open or close a
+    // take itself — it posts the hotkey edges a tap would have produced, and
+    // the arm above decides what they mean, so there is exactly one path that
+    // starts a take and one set of rules about when it may.
+    #[cfg(not(target_os = "linux"))]
+    let gesture_proxy = event_loop.create_proxy();
+
+    // Handed to each settings window so it can say it saved.
+    #[cfg(not(target_os = "linux"))]
+    let setting_proxy = event_loop.create_proxy();
+
+    // Handed to the floating button, which talks to the loop the same way the
+    // tray does — by posting, never by touching state.
+    #[cfg(not(target_os = "linux"))]
+    let floating_proxy = event_loop.create_proxy();
+
+    // The control channel's listener blocks, so it gets a thread of its own. It
+    // posts to the loop exactly like every other outside caller — the tray, the
+    // button, the hotkey — so a command from another process cannot mean
+    // anything a click could not already mean.
+    if let Some(channel) = channel {
+        let proxy = event_loop.create_proxy();
+        let spawned = std::thread::Builder::new()
+            .name("splaude-control".into())
+            .spawn(move || {
+                channel.serve(move |command| {
+                    let _ = proxy.send_event(Wake::Control(command));
+                });
+                diagnostic::log("control", "the control channel stopped listening");
+            });
+
+        if let Err(error) = spawned {
+            diagnostic::log(
+                "control",
+                format!("could not start the control listener: {error}"),
+            );
+        }
+    }
+
     println!("splaude is listening.");
     println!(
         "Hold {} to talk, or tap to latch it on. Ctrl+C to quit.",
@@ -371,6 +573,15 @@ fn run() -> Result<()> {
     // the hotkey still works, there is just nothing to look at or quit from.
     #[cfg(not(target_os = "linux"))]
     let mut status: Option<tray::Tray> = None;
+    // `None` when the setting is off, when the button could not be created, or
+    // on a platform that has none. Every use is through `wear`, so an absent
+    // button is not a special case anywhere else.
+    #[cfg(not(target_os = "linux"))]
+    let mut floating: Option<floating::Handle> = None;
+    // When the microphone last went quiet, or `None` while somebody is talking.
+    // Only ever consulted for a latched take — see `latch_timeout_second`.
+    #[cfg(not(target_os = "linux"))]
+    let mut quiet_since: Option<Instant> = None;
     // Whether the file on disk failed to parse. While it did, nothing here
     // writes over it: the broken text is the user's own edit, and saving
     // defaults on top of it would destroy the keyterms and the binding they
@@ -404,10 +615,11 @@ fn run() -> Result<()> {
                     }
                     Err(error) => eprintln!("splaude: {error:#}"),
                 }
+
+                floating = raise_floating(&setting, &floating_proxy);
             }
 
-            Event::UserEvent(Wake::Hotkey(edge)) => {
-                let now = Instant::now();
+            Event::UserEvent(Wake::Hotkey(edge, now)) => {
                 match act(take.as_ref().map(|running| running.grip), edge, now) {
                     Act::Start => {
                         #[cfg(not(target_os = "linux"))]
@@ -438,11 +650,23 @@ fn run() -> Result<()> {
                                 // Step zero — the meter starts empty and the first
                                 // audio buffer raises it.
                                 #[cfg(not(target_os = "linux"))]
-                                if let Some(shown) = status.as_mut() {
-                                    shown.set_mood(tray::Mood::Recording(0));
-                                }
+                                wear(status.as_mut(), floating.as_ref(), tray::Mood::Recording(0));
                             }
                             Err(error) => {
+                                // Both, and the log is the half that matters.
+                                // A tray app started from Explorer or from
+                                // launch-at-login has no stderr anyone will
+                                // read, so a take that cannot start has always
+                                // looked from outside exactly like a hotkey
+                                // that did nothing — which is the failure this
+                                // log exists to end. "No input device" is the
+                                // common one, and it is not a splaude problem
+                                // to solve: a remote-desktop session with no
+                                // audio redirected has no microphone at all.
+                                diagnostic::log(
+                                    "take",
+                                    format!("could not start: {error:#}"),
+                                );
                                 eprintln!("splaude: {error:#}");
                                 // The take may well have died on the credential, so
                                 // say so in the menu now rather than at the next
@@ -470,12 +694,67 @@ fn run() -> Result<()> {
                             running.finish();
                         }
                         #[cfg(not(target_os = "linux"))]
-                        if let Some(shown) = status.as_mut() {
-                            shown.set_mood(tray::Mood::Idle);
-                        }
+                        wear(status.as_mut(), floating.as_ref(), tray::Mood::Idle);
                     }
 
                     Act::Ignore => {}
+                }
+            }
+
+            // A click is a tap, and says so in edges rather than in state.
+            // Starting a take from here by hand would mean a second copy of the
+            // start path — the report, the grip, the Return watcher, the icon,
+            // the credential re-read on failure — and two copies of "when may a
+            // take begin" is how the overlap guard gets a hole in it. Posting
+            // the gesture instead means a click can only ask for what a person
+            // with a keyboard could already have asked for.
+            #[cfg(not(target_os = "linux"))]
+            Event::UserEvent(Wake::Gesture) => {
+                let edge: &[HotkeyEdge] = match take.as_ref().map(|running| running.grip) {
+                    // Press then release: `act` starts the take on the press and
+                    // latches it on the release, because the two arrive
+                    // microseconds apart and that is a tap. Latched is the only
+                    // grip that makes sense for a click — nothing is being held
+                    // down, so nothing can end the take by being let go.
+                    None => &[HotkeyEdge::Pressed, HotkeyEdge::Released],
+                    // A latched take ends on the next press, which is the same
+                    // gesture that ends it from the keyboard.
+                    Some(Grip::Latched) => &[HotkeyEdge::Pressed],
+                    // The key is physically down. A release we invented would
+                    // end the take underneath a user who is still holding it,
+                    // and their real release would then arrive with nothing to
+                    // end. Let the key finish what the key started.
+                    Some(Grip::Held(_)) => {
+                        diagnostic::log(
+                            "take",
+                            "the hotkey is held — let go of it rather than clicking",
+                        );
+                        &[]
+                    }
+                };
+
+                // One instant for both edges, so the pair is unambiguously a
+                // tap however long the socket takes to open in between.
+                let at = Instant::now();
+                for what in edge {
+                    let _ = gesture_proxy.send_event(Wake::Hotkey(*what, at));
+                }
+            }
+
+            // Written through immediately rather than at exit: the process is a
+            // background app that is usually ended by Quit or by logging out,
+            // and a position only saved on a clean shutdown is a position that
+            // is usually lost.
+            #[cfg(not(target_os = "linux"))]
+            Event::UserEvent(Wake::FloatingMoved(point)) => {
+                setting.floating_button_point = Some(point);
+                if file_broken {
+                    diagnostic::log(
+                        "floating",
+                        "the settings file did not parse, so the new position is not saved over it",
+                    );
+                } else if let Err(error) = setting.save() {
+                    diagnostic::log("floating", format!("could not save the position: {error}"));
                 }
             }
 
@@ -488,9 +767,7 @@ fn run() -> Result<()> {
                     diagnostic::log("submit", "Return pressed — ending the take");
                     running.finish();
                     #[cfg(not(target_os = "linux"))]
-                    if let Some(shown) = status.as_mut() {
-                        shown.set_mood(tray::Mood::Idle);
-                    }
+                    wear(status.as_mut(), floating.as_ref(), tray::Mood::Idle);
                 }
             }
 
@@ -499,11 +776,57 @@ fn run() -> Result<()> {
             // that would re-redden an icon which has already gone idle.
             #[cfg(not(target_os = "linux"))]
             Event::UserEvent(Wake::Level(step)) => {
-                if let Some(shown) = status.as_mut() {
-                    if shown.is_recording() {
-                        shown.set_mood(tray::Mood::Recording(step));
+                let recording = status.as_ref().is_some_and(tray::Tray::is_recording);
+                if recording {
+                    wear(status.as_mut(), floating.as_ref(), tray::Mood::Recording(step));
+                }
+            }
+
+            // Deliberately expressed in the vocabulary the tray and the
+            // floating button already use, rather than in a second one. A
+            // command from outside can ask for exactly what a click can ask
+            // for, which is what keeps the channel from becoming a way to drive
+            // this app from a script in ways nobody designed for.
+            Event::UserEvent(Wake::Control(command)) => match command {
+                control::Command::Show => {
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        let proxy = setting_proxy.clone();
+                        if let Err(error) = setting_window::open(Box::new(move || {
+                            let _ = proxy.send_event(Wake::SettingSaved);
+                        })) {
+                            diagnostic::log("setting", format!("{error:#}"));
+                        }
                     }
                 }
+
+                #[cfg(not(target_os = "linux"))]
+                control::Command::Toggle => {
+                    let _ = gesture_proxy.send_event(Wake::Gesture);
+                }
+
+                // Ends the take and throws the words away. The distinction from
+                // Toggle is the whole reason it exists: stopping inserts what
+                // you said, and the case this is for is realising you were
+                // dictating into the wrong window.
+                control::Command::Cancel => {
+                    if let Some(running) = take.take() {
+                        diagnostic::log("control", "cancelled — the take is discarded");
+                        running.discard();
+                        #[cfg(not(target_os = "linux"))]
+                        wear(status.as_mut(), floating.as_ref(), tray::Mood::Idle);
+                    }
+                }
+
+                #[cfg(target_os = "linux")]
+                control::Command::Toggle => {
+                    diagnostic::log("control", "no tray on Linux — nothing to toggle from here");
+                }
+            },
+
+            #[cfg(not(target_os = "linux"))]
+            Event::UserEvent(Wake::Silence(quiet)) => {
+                quiet_since = quiet.then(Instant::now);
             }
 
             #[cfg(not(target_os = "linux"))]
@@ -517,6 +840,29 @@ fn run() -> Result<()> {
             Event::UserEvent(Wake::Health(headline)) => {
                 if let Some(shown) = status.as_mut() {
                     shown.set_health(headline);
+                }
+            }
+
+            // Same refusal as the menu item, for the same reason: a rebind
+            // that lands while the user is holding the old binding moves the
+            // key underneath them. The file already has the change, so the next
+            // reload — a click, or the next save — applies it.
+            #[cfg(not(target_os = "linux"))]
+            Event::UserEvent(Wake::SettingSaved) => {
+                if take.is_some() {
+                    diagnostic::log(
+                        "setting",
+                        "saved from the settings window, but a take is on the air —                          it will apply at the next reload",
+                    );
+                } else {
+                    file_broken = !reload(
+                        &mut setting,
+                        hotkey.as_mut(),
+                        &injector,
+                        &mut stop_on_return,
+                        status.as_mut(),
+                    );
+                    reconcile_floating(&setting, &mut floating, &floating_proxy);
                 }
             }
 
@@ -544,6 +890,37 @@ fn run() -> Result<()> {
 
                 tray::Ask::RevealLog => tray::reveal_log(),
 
+                // A click is a tap, and says so in edges rather than in state.
+                // Starting a take from here by hand would mean a second copy of
+                // the start path — the report, the grip, the Return watcher, the
+                // icon, the credential re-read on failure — and two copies of
+                // "when may a take begin" is how the overlap guard gets a hole
+                // in it. Posting the gesture instead means the menu can only ask
+                // for what a person with a keyboard could already have asked for.
+                tray::Ask::ToggleDictation => {
+                    let _ = gesture_proxy.send_event(Wake::Gesture);
+                }
+
+                // The one warning in the menu whose fix is a command. Putting
+                // it on the clipboard is `showCredentialHelp` in the Swift
+                // build, and for its reason: the fix has to be typed into a
+                // terminal, and nobody should have to transcribe it from a menu
+                // that closed when they clicked it.
+                tray::Ask::CredentialHelp => {
+                    let copied = arboard::Clipboard::new()
+                        .and_then(|mut board| board.set_text(CREDENTIAL_FIX.to_string()));
+                    match copied {
+                        Ok(()) => diagnostic::log(
+                            "credential",
+                            format!("`{CREDENTIAL_FIX}` is on the clipboard — run it in a terminal, then click Reload Settings"),
+                        ),
+                        Err(error) => diagnostic::log(
+                            "credential",
+                            format!("could not copy the fix to the clipboard: {error} — run `{CREDENTIAL_FIX}` in a terminal"),
+                        ),
+                    }
+                }
+
                 // Deliberately not gated on whether a take is running: the
                 // whole point is to answer "do keystrokes from this app land
                 // anywhere" without speaking, so it has to work at rest.
@@ -557,6 +934,19 @@ fn run() -> Result<()> {
                     update::Reading::Available(release) => tray::open_release(&release.url),
                     _ => check_update(update_proxy.clone()),
                 },
+
+                // The window writes the file and nothing else — see its own
+                // header. What it asks for when it has written is exactly this
+                // arm, so a change made in the window and a change made in a
+                // text editor reach the running app by the same path.
+                tray::Ask::OpenSetting => {
+                    let proxy = setting_proxy.clone();
+                    if let Err(error) = setting_window::open(Box::new(move || {
+                        let _ = proxy.send_event(Wake::SettingSaved);
+                    })) {
+                        diagnostic::log("setting", format!("{error:#}"));
+                    }
+                }
 
                 tray::Ask::EditSetting => tray::edit_setting(&setting),
 
@@ -581,6 +971,7 @@ fn run() -> Result<()> {
                             &mut stop_on_return,
                             status.as_mut(),
                         );
+                        reconcile_floating(&setting, &mut floating, &floating_proxy);
                     }
                 }
 
@@ -616,6 +1007,13 @@ fn run() -> Result<()> {
                 if let Some(running) = take.take() {
                     running.finish();
                 }
+                // Before the tray icon goes: a topmost window left behind by a
+                // process that has exited is the one piece of this app a user
+                // cannot get rid of without the task manager.
+                #[cfg(not(target_os = "linux"))]
+                if let Some(button) = floating.take() {
+                    button.close();
+                }
                 drop(hotkey.take());
                 // Dropping the last handle is what removes the icon; leaving it
                 // to process teardown leaves a ghost in the tray until hover.
@@ -623,6 +1021,44 @@ fn run() -> Result<()> {
                 drop(status.take());
             }
             _ => {}
+        }
+
+        // The latch timeout, decided after every event rather than inside any
+        // one of them, because it depends on three things that change in
+        // different arms: whether a take is latched, whether the microphone is
+        // quiet, and how long it has been.
+        //
+        // A held take is never ended here. The key is the contract — it ends
+        // when the user lets go — and a hold that outlived the timeout is
+        // someone still pressing the button, not someone who forgot.
+        #[cfg(not(target_os = "linux"))]
+        if *flow != ControlFlow::Exit {
+            match latch(
+                take.as_ref().map(|running| running.grip),
+                quiet_since,
+                setting.latch_timeout_second,
+                Instant::now(),
+            ) {
+                Latch::Expired => {
+                    if let Some(running) = take.take() {
+                        diagnostic::log(
+                            "take",
+                            format!(
+                                "latched and silent for {}s — ending the take",
+                                setting.latch_timeout_second
+                            ),
+                        );
+                        running.finish();
+                    }
+                    quiet_since = None;
+                    wear(status.as_mut(), floating.as_ref(), tray::Mood::Idle);
+                }
+                // Wake exactly when it expires and not before. Without this the
+                // loop would sleep until the next keystroke or audio event, and
+                // a microphone left open in a silent room produces neither.
+                Latch::WaitUntil(at) => *flow = ControlFlow::WaitUntil(at),
+                Latch::Nothing => {}
+            }
         }
     })
 }
@@ -817,14 +1253,18 @@ fn report(
     level: &tao::event_loop::EventLoopProxy<Wake>,
     transcript: &tao::event_loop::EventLoopProxy<Wake>,
 ) -> Report {
-    use std::sync::atomic::{AtomicU8, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
     let level = level.clone();
+    let quiet_proxy = level.clone();
     let transcript = transcript.clone();
     // Atomic rather than a `Cell` because the audio callback hands out `Fn`,
     // not `FnMut`, and it runs on a thread neither the loop nor this function
     // owns. `u8::MAX` is not a step, so the first buffer always reports.
     let last = AtomicU8::new(u8::MAX);
+    // A take starts with somebody about to speak, so it starts loud. Beginning
+    // at "quiet" would arm the latch timeout before a word was said.
+    let was_quiet = AtomicBool::new(false);
 
     Report {
         level: Box::new(move |reading| {
@@ -835,6 +1275,18 @@ fn report(
             let step = tray::step_of(reading);
             if last.swap(step, Ordering::Relaxed) != step {
                 let _ = level.send_event(Wake::Level(step));
+            }
+
+            // Silence is asked of the raw reading rather than of the step
+            // above, and the difference matters. A step is a fifth of full
+            // scale, so step zero covers everything under 20% — which includes
+            // a quiet speaker talking normally. Cutting their take off would be
+            // a far worse bug than the one the latch timeout fixes. This
+            // threshold is the noise floor of a room, not the bottom of the
+            // meter.
+            let quiet = reading < SILENCE_LEVEL;
+            if was_quiet.swap(quiet, Ordering::Relaxed) != quiet {
+                let _ = quiet_proxy.send_event(Wake::Silence(quiet));
             }
         }),
         transcript: Box::new(move |text| {
@@ -863,6 +1315,14 @@ fn check() -> Result<()> {
     println!("  launch at login {}", mark(capability.autostart));
     if let Some(note) = &capability.note {
         println!("  note: {note}");
+    }
+    // Not part of `Capability`, which answers what this build can do, while
+    // this answers what this machine currently has plugged in. It belongs in
+    // the report either way: no input device is the most common reason a take
+    // does nothing, and it is invisible until someone presses the key.
+    match splaude_platform::audio::default_input_name() {
+        Some(name) => println!("  microphone     {name}"),
+        None => println!("  microphone     none — dictation cannot start without one"),
     }
     println!();
 
@@ -893,6 +1353,18 @@ fn check() -> Result<()> {
     }
     println!("  hotkey    {}", setting.hotkey);
     println!("  language  {}", setting.language);
+    // Which provider a take would actually reach, and whether it could. A user
+    // who has switched providers and is getting nothing needs to see both
+    // halves here rather than discovering the empty key when they press the
+    // key.
+    match setting.speech_backend.trim() {
+        "deepgram" if setting.api_key.trim().is_empty() => {
+            println!("  backend   deepgram — but apiKey is empty, so no take can start")
+        }
+        "deepgram" => println!("  backend   deepgram (your own key)"),
+        "anthropic" | "" => println!("  backend   anthropic (the Claude Code credential)"),
+        other => println!("  backend   {other} is not a known backend — anthropic will be used"),
+    }
     println!("  live typing {}", mark(setting.live_typing));
     // Names whatever is in front right now, and says whether a take aimed at it
     // would be buffered. A user whose dictation arrives as a run of `a` in a
@@ -908,6 +1380,157 @@ fn check() -> Result<()> {
     println!("  log       {}", diagnostic::path().display());
 
     Ok(())
+}
+
+/// Brings the floating button into line with the settings, after a reload.
+///
+/// Only its presence, not its position: the button is the authority on where it
+/// is — the user drags it — and a reload that moved it back to whatever the file
+/// last recorded would fight them.
+#[cfg(not(target_os = "linux"))]
+fn reconcile_floating(
+    setting: &Setting,
+    floating: &mut Option<floating::Handle>,
+    proxy: &EventLoopProxy<Wake>,
+) {
+    match (setting.show_floating_button, floating.is_some()) {
+        (true, false) => *floating = raise_floating(setting, proxy),
+        (false, true) => {
+            if let Some(button) = floating.take() {
+                button.close();
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Puts the same mood on every surface that shows one.
+///
+/// The tray and the floating button are two views of one fact — whether a take
+/// is on the air, and how loud it is — and the way that goes wrong is one of
+/// them being updated at a call site that forgot the other. There is one call
+/// site shape instead, and both are absent-safe.
+#[cfg(not(target_os = "linux"))]
+fn wear(status: Option<&mut tray::Tray>, floating: Option<&floating::Handle>, mood: tray::Mood) {
+    if let Some(shown) = status {
+        shown.set_mood(mood);
+    }
+    if let Some(button) = floating {
+        button.set_mood(mood);
+    }
+}
+
+/// Shows the floating button, if the settings ask for one.
+///
+/// A failure here is logged and swallowed. The button is a convenience over a
+/// hotkey that still works, and refusing to start the app because a decoration
+/// could not be drawn would trade a small loss for the whole thing.
+#[cfg(not(target_os = "linux"))]
+fn raise_floating(setting: &Setting, proxy: &EventLoopProxy<Wake>) -> Option<floating::Handle> {
+    if !setting.show_floating_button {
+        return None;
+    }
+
+    let clicked = proxy.clone();
+    let moved = proxy.clone();
+
+    match floating::show(
+        setting.floating_button_point,
+        Box::new(move || {
+            let _ = clicked.send_event(Wake::Gesture);
+        }),
+        Box::new(move |point| {
+            let _ = moved.send_event(Wake::FloatingMoved(point));
+        }),
+    ) {
+        Ok(button) => Some(button),
+        Err(error) => {
+            diagnostic::log("floating", format!("{error:#}"));
+            None
+        }
+    }
+}
+
+/// Opens the settings window and waits for it to close.
+///
+/// Nothing to tell about a save here: there is no event loop running to hear
+/// it, and the window has already written the file — the next `splaude` to
+/// start reads it.
+#[cfg(not(target_os = "linux"))]
+fn settings() -> Result<()> {
+    // The window writes the settings file and can fail doing it — a read-only
+    // directory, a disk that is full — and on this path there is no tray, no
+    // console anybody is watching, and until now no log either. That made
+    // `--settings` the one entry point where a save could fail in total
+    // silence, which is the failure mode every other part of this app has
+    // already been taught not to have.
+    diagnostic::to_file();
+
+    match setting_window::open(Box::new(|| {}))? {
+        Some(window) => {
+            // The error is the thread having panicked, which is not something
+            // this process can do anything about beyond not pretending it went
+            // well.
+            window
+                .join()
+                .map_err(|_| anyhow::anyhow!("the settings window ended unexpectedly"))?;
+            Ok(())
+        }
+        // Only reachable if a window were somehow already open in this same
+        // process, which cannot happen on this path.
+        None => Ok(()),
+    }
+}
+
+/// Tells Windows this process does its own scaling.
+///
+/// Without it a process is *DPI-unaware*, and Windows compensates by rendering
+/// its windows at 96 DPI and bitmap-stretching the result — so on a 150%
+/// display the settings window and the floating button come up the right size
+/// and visibly blurred, with text that looks like a photograph of text. That is
+/// the single loudest way a hand-written Win32 window announces that nobody
+/// looked at it.
+///
+/// System-aware rather than per-monitor: the layout is computed once when a
+/// window is created, and per-monitor awareness promises something this code
+/// does not do — relaying out when a window is dragged between two displays at
+/// different scales. Claiming it and then not honouring it would be worse than
+/// not claiming it, because Windows would stop compensating for the case it
+/// currently handles.
+///
+/// Called before anything creates a window, which is what the API requires; it
+/// is ignored once one exists. Failure is not worth reporting — the answer is
+/// the old blurry behaviour, not a broken app.
+#[cfg(windows)]
+fn declare_dpi_awareness() {
+    use windows::Win32::UI::HiDpi::{
+        SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_SYSTEM_AWARE,
+    };
+
+    // SAFETY: takes a context constant by value and returns whether it was
+    // accepted. No pointers, and nothing borrowed.
+    unsafe {
+        let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_SYSTEM_AWARE);
+    }
+}
+
+/// Nothing to declare. macOS and Linux scale by points and backing factors
+/// rather than by asking the process to opt in.
+#[cfg(not(windows))]
+fn declare_dpi_awareness() {}
+
+/// Hands a command to the running instance and says what happened.
+///
+/// An exit code of 1 when nobody is listening, because this is a command
+/// somebody has bound to a key or put in a script: "there was nothing to talk
+/// to" has to be distinguishable from "done" without reading the words.
+fn forward(command: control::Command) -> Result<()> {
+    match control::send(command)? {
+        control::Delivery::Taken => Ok(()),
+        control::Delivery::NobodyListening => {
+            bail!("splaude is not running — start it first")
+        }
+    }
 }
 
 /// Where the Claude Code credential is read from.
@@ -930,6 +1553,94 @@ fn mark(yes: bool) -> &'static str {
 
 #[cfg(test)]
 mod test {
+
+    /// The latch timeout, which cannot be exercised in a real take on a machine
+    /// with no microphone — so it is a pure rule with a clock passed in.
+    #[cfg(not(target_os = "linux"))]
+    mod latching {
+        use super::*;
+
+        fn now() -> Instant {
+            Instant::now()
+        }
+
+        #[test]
+        fn a_latched_take_that_has_been_quiet_long_enough_expires() {
+            let quiet = now();
+            let later = quiet + Duration::from_secs(31);
+            assert_eq!(
+                latch(Some(Grip::Latched), Some(quiet), 30, later),
+                Latch::Expired
+            );
+        }
+
+        #[test]
+        fn a_latched_take_that_has_not_waited_long_enough_sleeps_until_it_has() {
+            let quiet = now();
+            let soon = quiet + Duration::from_secs(5);
+            assert_eq!(
+                latch(Some(Grip::Latched), Some(quiet), 30, soon),
+                Latch::WaitUntil(quiet + Duration::from_secs(30))
+            );
+        }
+
+        /// The rule that keeps this from being a bug: a key that is still down
+        /// is somebody still talking into it, however long the silence.
+        #[test]
+        fn a_held_take_is_never_ended_by_silence() {
+            let quiet = now();
+            let much_later = quiet + Duration::from_secs(600);
+            assert_eq!(
+                latch(Some(Grip::Held(quiet)), Some(quiet), 30, much_later),
+                Latch::Nothing
+            );
+        }
+
+        #[test]
+        fn a_take_that_is_not_quiet_is_not_waiting_on_anything() {
+            assert_eq!(latch(Some(Grip::Latched), None, 30, now()), Latch::Nothing);
+        }
+
+        #[test]
+        fn no_take_means_nothing_to_end() {
+            assert_eq!(latch(None, Some(now()), 30, now()), Latch::Nothing);
+        }
+
+        /// Zero is the documented way to turn it off, and it must hold even for
+        /// a take that has been silent for an hour.
+        #[test]
+        fn a_timeout_of_zero_never_ends_a_take() {
+            let quiet = now();
+            let much_later = quiet + Duration::from_secs(3_600);
+            assert_eq!(
+                latch(Some(Grip::Latched), Some(quiet), 0, much_later),
+                Latch::Nothing
+            );
+        }
+
+        /// Exactly at the threshold counts as expired, so a timeout of N is
+        /// honoured at N rather than at N plus one event.
+        #[test]
+        fn the_boundary_expires_rather_than_waiting_one_more_round() {
+            let quiet = now();
+            let exactly = quiet + Duration::from_secs(30);
+            assert_eq!(
+                latch(Some(Grip::Latched), Some(quiet), 30, exactly),
+                Latch::Expired
+            );
+        }
+
+        /// A clock read on the audio thread can land marginally ahead of this
+        /// one; subtracting it must not panic.
+        #[test]
+        fn an_instant_from_the_future_does_not_panic() {
+            let quiet = now() + Duration::from_secs(5);
+            assert!(matches!(
+                latch(Some(Grip::Latched), Some(quiet), 30, now()),
+                Latch::WaitUntil(_)
+            ));
+        }
+    }
     use super::*;
 
     // Classification only. Nothing here starts a take, installs a hook, opens

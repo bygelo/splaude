@@ -30,5 +30,36 @@ splaude-core = { version = "0.2.0", path = "../core" }
 arboard = { version = "3.6.1", default-features = false }
 
 [target."cfg(windows)".dependencies]
-windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    # `SendInput`, for the one character enigo will not carry as a payload.
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+    # The control channel — a named pipe, which doubles as the single-instance
+    # claim.
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
+] }
 winreg = "0.56.0"
+
+# The injection test owns a real window and reads characters back out of it, so
+# it needs the same Win32 surface the crate itself does. A dev-dependency
+# because an integration test links the crate rather than living inside it, and
+# so cannot borrow its dependencies.
+[target."cfg(windows)".dev-dependencies]
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    # `WNDCLASSW` carries an `HBRUSH`, so registering a class needs GDI even
+    # though nothing here draws.
+    "Win32_Graphics_Gdi",
+    "Win32_System_LibraryLoader",
+    # `AttachThreadInput` + `GetCurrentThreadId`, to get past the foreground
+    # lock. Without them the suite passes once and never again.
+    "Win32_System_Threading",
+    "Win32_UI_Controls",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }

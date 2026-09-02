@@ -7,6 +7,7 @@
 //! main-thread assumptions.
 
 pub mod anthropic;
+pub mod deepgram;
 
 pub use anthropic::AnthropicSpeechBackend;
 

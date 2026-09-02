@@ -33,6 +33,24 @@ const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(8);
 const CLOSE_GRACE: Duration = Duration::from_secs(3);
 const KEYTERM_BYTE_BUDGET: usize = 1024;
 
+/// How many terms the recogniser will actually take, whatever the budget above
+/// allows.
+///
+/// The two limits are not the same limit and it took a sweep of the provider's
+/// own documentation to notice. 1024 characters is the *header* budget, and
+/// with terms of an average length it happens to work out at about a hundred
+/// entries — so for most people the two bind at the same moment and nobody
+/// sees a difference. Somebody with two hundred short names does: they fit
+/// inside the header comfortably, are sent, and the ones past the ceiling do
+/// nothing at all. A limit you cannot see is worse than a smaller limit you can.
+///
+/// Deepgram documents keyterm prompting as covering "up to 100" terms, and the
+/// endpoint splaude talks to runs Nova-3 behind it. That is the basis for the
+/// number and it is worth being plain that it is second-hand: nobody here has
+/// measured recall against term 101. Cutting at a documented ceiling and saying
+/// so beats sending terms that are silently ignored.
+const KEYTERM_COUNT_CEILING: usize = 100;
+
 /// How far ahead of the clock the writer is allowed to run — the amount of
 /// not-yet-spoken audio the server may be holding at any moment.
 ///
@@ -57,7 +75,11 @@ const CLOSE_FRAME: &str = r#"{"type":"CloseStream"}"#;
 /// rustls 0.23 refuses to pick a crypto provider on its own once more than one
 /// could exist, and a missing provider surfaces as a confusing handshake panic
 /// rather than a connection error. Install ours once, on first connect.
-fn ensure_crypto_provider() {
+///
+/// Shared with every other backend rather than copied into each: it is a fact
+/// about the TLS stack this binary links, not about any one provider, and two
+/// copies could disagree about which provider is installed.
+pub(crate) fn ensure_crypto_provider() {
     static ONCE: OnceLock<()> = OnceLock::new();
     ONCE.get_or_init(|| {
         // Errs only if something already installed one, which is fine.
@@ -534,6 +556,10 @@ pub fn pack_keyterm(term: &[String]) -> String {
             continue;
         }
 
+        if kept.len() == KEYTERM_COUNT_CEILING {
+            break;
+        }
+
         let cost = clean.chars().count() + usize::from(!kept.is_empty());
         if length + cost > KEYTERM_BYTE_BUDGET {
             break;
@@ -560,6 +586,29 @@ fn urlencode(value: &str) -> String {
 
 #[cfg(test)]
 mod test {
+
+    /// The second ceiling, and the one that is invisible without this.
+    ///
+    /// Two hundred short terms fit inside the character budget easily, so
+    /// before this they were all sent and the ones past a hundred did nothing.
+    #[test]
+    fn packing_stops_at_the_term_ceiling_even_when_the_budget_allows_more() {
+        let many: Vec<String> = (0..200).map(|index| format!("t{index}")).collect();
+        let packed = pack_keyterm(&many);
+
+        assert_eq!(packed.split(',').count(), KEYTERM_COUNT_CEILING);
+        // And it is the ceiling that bound here, not the budget.
+        assert!(packed.len() < KEYTERM_BYTE_BUDGET);
+    }
+
+    /// The ceiling must not cost anybody terms they were already getting: a
+    /// list under it is packed whole.
+    #[test]
+    fn a_list_under_the_ceiling_is_untouched_by_it() {
+        let some: Vec<String> = (0..20).map(|index| format!("term{index}")).collect();
+        let packed = pack_keyterm(&some);
+        assert_eq!(packed.split(',').count(), 20);
+    }
     use super::*;
 
     fn term(list: &[&str]) -> Vec<String> {

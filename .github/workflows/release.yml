@@ -50,6 +50,15 @@ jobs:
     name: Binary — ${{ matrix.platform }}
     needs: version
     runs-on: ${{ matrix.os }}
+
+    # Narrower than the workflow's own `contents: write`, plus the two this job
+    # needs to attest what it built. `id-token` is what lets the runner prove to
+    # Sigstore that it is this workflow in this repository at this commit;
+    # `attestations` is what lets it record the result against the release.
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     strategy:
       # One platform failing is the interesting case, so let the others finish
       # rather than cancelling them.
@@ -143,12 +152,69 @@ jobs:
           # contribute an output, and the release job needs all of them.
           echo "$(sha256sum "$name" | cut -d' ' -f1)  $name" > "$name.sha256"
 
+      # Rendered here rather than by hand at submission time, because the two
+      # values that change per release are the version and a SHA-256 — and a
+      # hash copied by a person is a hash that is eventually wrong, in a file
+      # whose entire job is to say what the bytes should be.
+      #
+      # Windows only: the manifest describes a Windows installer, and rendering
+      # it on the Linux leg would attach a file naming an .exe that leg never
+      # built.
+      - name: Render the winget manifest
+        if: runner.os == 'Windows'
+        run: |
+          version="${{ needs.version.outputs.version }}"
+          sha=$(sha256sum "${{ steps.package.outputs.name }}" | cut -d' ' -f1 | tr 'a-f' 'A-F')
+          date=$(date -u +%Y-%m-%d)
+
+          mkdir -p winget-out
+          for file in Package/winget/*.yaml; do
+            sed -e "s/{{VERSION}}/$version/g"                 -e "s/{{SHA256}}/$sha/g"                 -e "s/{{DATE}}/$date/g"                 "$file" > "winget-out/$(basename "$file")"
+          done
+
+          # A leftover placeholder means the template grew a field the renderer
+          # does not know about, and submitting that is a rejected pull request
+          # at best. Fail here, where it is one line to fix.
+          if grep -rq '{{' winget-out; then
+            echo "::error::a winget manifest still holds an unrendered placeholder"
+            grep -rn '{{' winget-out
+            exit 1
+          fi
+
+          (cd winget-out && zip -q "../winget-$version.zip" ./*.yaml)
+          echo "winget=winget-$version.zip" >> "$GITHUB_OUTPUT"
+        id: winget
+
+      # What the download is, and where it came from.
+      #
+      # The `.sha256` beside each asset already answers "did this arrive
+      # intact". It cannot answer "did splaude build this", because anyone who
+      # replaces the file can replace the checksum next to it. An attestation is
+      # signed by GitHub's own identity for this workflow, this repository and
+      # this commit, so a download can be checked against something the person
+      # offering it does not control:
+      #
+      #     gh attestation verify splaude-0.3.0-windows-x86_64.exe --repo bygelo/splaude
+      #
+      # Chosen over shipping a minisign key because the alternative is a signing
+      # key that has to live somewhere, be rotated by somebody, and be trusted
+      # on the word of the same README that would be compromised alongside it.
+      # This is not code signing — SmartScreen and Gatekeeper know nothing about
+      # it — and it is not a substitute for the certificate that would quiet
+      # them. It answers provenance, which is the question a checksum was
+      # already pretending to.
+      - name: Attest provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: ${{ steps.package.outputs.name }}
+
       - uses: actions/upload-artifact@v4
         with:
           name: binary-${{ matrix.platform }}
           path: |
             ${{ steps.package.outputs.name }}
             ${{ steps.package.outputs.name }}.sha256
+            ${{ steps.winget.outputs.winget }}
           if-no-files-found: error
 
   release:

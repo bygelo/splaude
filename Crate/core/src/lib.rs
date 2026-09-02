@@ -9,12 +9,14 @@
 pub mod credential;
 pub mod diagnostic;
 pub mod quota;
+pub mod replacement;
 pub mod setting;
 pub mod speech;
 pub mod typer;
 pub mod update;
 
 pub use credential::{Credential, CredentialError, CredentialSource, Health, Store};
+pub use replacement::Rule;
 pub use setting::{Code, Hotkey, Modifiers, Setting};
 pub use speech::{SpeechAudioFormat, SpeechEvent, TranscriptBuffer};
 pub use typer::{TypeAction, Typer};

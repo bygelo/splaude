@@ -46,6 +46,28 @@ enum TokenStore {
         .homeDirectoryForCurrentUser
         .appendingPathComponent(".claude/.credentials.json")
 
+    /// splaude's own copy of the last credential it managed to read.
+    ///
+    /// The Keychain item belongs to Claude Code, so every read of it is an ACL
+    /// decision, and macOS asks for the login password whenever the stored
+    /// grant does not apply. Two things make that happen repeatedly rather than
+    /// once: releases are ad-hoc signed, so every build is a different binary
+    /// and the old *Always Allow* no longer matches, and Claude Code rewriting
+    /// the item on each token refresh resets its ACL. An in-memory cache only
+    /// covered one launch, so the password came back the next time either of
+    /// those happened.
+    ///
+    /// This copy makes it one prompt per *credential* instead. It holds the same
+    /// secret the Keychain item does, in the same shape Claude Code itself
+    /// writes at ~/.claude/.credentials.json on platforms with no Keychain —
+    /// owner-only, 0600 inside a 0700 directory. Settable so the tests can
+    /// exercise the round trip without touching the real one.
+    static var cacheFile: URL = FileManager.default
+        .homeDirectoryForCurrentUser
+        .appendingPathComponent("Library/Application Support/splaude/credential.json")
+
+    private static let cacheLabel = "splaude cache"
+
     /// The credential lives in a Keychain item owned by Claude Code, so every
     /// read is an ACL decision and macOS prompts for the login password unless
     /// the user has clicked *Always Allow*. Reading it per take meant one
@@ -75,9 +97,19 @@ enum TokenStore {
         lock.lock()
         defer { lock.unlock() }
 
-        if let cached {
-            if !cached.isExpired { return cached }
-            // Expired, but re-reading on every call would hammer the Keychain.
+        if let cached, !cached.isExpired { return cached }
+
+        // splaude's own copy: the only source that cannot put up a password
+        // dialog. A live copy is enough; an expired one is ignored so we go
+        // back to whatever Claude Code last wrote.
+        if let onDisk = readCache(), !onDisk.isExpired {
+            cached = onDisk
+            return onDisk
+        }
+
+        if let cached, cached.isExpired {
+            // Expired, but re-reading on every call would hammer the Keychain
+            // — and each hit is a possible prompt.
             if let lastRead, Date().timeIntervalSince(lastRead) < staleRecheck {
                 return cached
             }
@@ -86,10 +118,11 @@ enum TokenStore {
         lastRead = Date()
         var firstFailure: Error?
 
-        for attempt in [readKeychain, readFile] {
+        for attempt in [readKeychainViaSecurityTool, readKeychain, readFile] {
             do {
                 if let credential = try attempt() {
                     cached = credential
+                    persist(credential)
                     return credential
                 }
             } catch {
@@ -98,6 +131,25 @@ enum TokenStore {
         }
 
         throw firstFailure ?? TokenError.notFound
+    }
+
+    /// A usable token if one is already known *without* reading the Keychain —
+    /// from memory, or from splaude's own cache. Nil means the next `load()`
+    /// may put up a password dialog, which is the one thing the hotkey path
+    /// must not do on the main thread.
+    static func unpromptedCredential() -> Credential? {
+        lock.lock()
+        if let cached, !cached.isExpired {
+            lock.unlock()
+            return cached
+        }
+        lock.unlock()
+
+        guard let fromCache = readCache() else { return nil }
+        lock.lock()
+        cached = fromCache
+        lock.unlock()
+        return fromCache.isExpired ? nil : fromCache
     }
 
     // MARK: - Health
@@ -186,9 +238,80 @@ enum TokenStore {
         lock.lock()
         defer { lock.unlock() }
         cached = nil
+        // The cache exists to spare a prompt, not to keep serving a token the
+        // server has already refused — a dead copy on disk would outlive the
+        // launch that learned it was dead.
+        try? FileManager.default.removeItem(at: cacheFile)
     }
 
     // MARK: - Source
+
+    /// Reads splaude's own copy. Never throws and never prompts: a missing or
+    /// unreadable cache is simply "nothing here".
+    ///
+    /// An expired copy is still parsed so callers can classify it; only
+    /// `unpromptedCredential` insists on a live one.
+    private static func readCache() -> Credential? {
+        guard let data = try? Data(contentsOf: cacheFile) else { return nil }
+        return try? parse(data, source: cacheLabel)
+    }
+
+    /// Writes the credential to `cacheFile`, owner-readable only.
+    ///
+    /// Failure here costs a password prompt next launch, not a take, so it is
+    /// logged rather than thrown.
+    private static func persist(_ credential: Credential) {
+        let payload: [String: Any?] = [
+            "accessToken": credential.accessToken,
+            "expiresAt": credential.expiresAt,
+            "origin": credential.source,
+        ]
+
+        let manager = FileManager.default
+        let directory = cacheFile.deletingLastPathComponent()
+
+        do {
+            try manager.createDirectory(at: directory, withIntermediateDirectories: true,
+                                        attributes: [.posixPermissions: 0o700])
+            let data = try JSONSerialization.data(
+                withJSONObject: payload.compactMapValues { $0 }
+            )
+            try data.write(to: cacheFile, options: [.atomic])
+            // An atomic write replaces the file, so the mode has to be set on
+            // whatever landed rather than once at creation.
+            try manager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: cacheFile.path)
+        } catch {
+            Diagnostic.log("credential", "could not cache the token (\(error.localizedDescription)) — expect a Keychain prompt next launch")
+        }
+    }
+
+    /// Reads the item through `/usr/bin/security`, the tool Claude Code itself
+    /// writes it with — so `security` is on the item's access list, and the
+    /// read never puts up a password dialog. A direct `SecItemCopyMatching`
+    /// from splaude is an ACL decision for an ad-hoc-signed binary: every
+    /// rebuild, and every token refresh that rewrites the item, asked for the
+    /// login password again (measured 2026-11-16: `security … -w` exit 0, no
+    /// prompt, from a headless shell). Falls through to the direct read when
+    /// the tool is missing or refuses.
+    private static func readKeychainViaSecurityTool() throws -> Credential? {
+        let tool = URL(fileURLWithPath: "/usr/bin/security")
+        guard FileManager.default.isExecutableFile(atPath: tool.path) else { return nil }
+        let process = Process()
+        process.executableURL = tool
+        process.arguments = ["find-generic-password", "-s", service, "-w"]
+        let out = Pipe()
+        process.standardOutput = out
+        process.standardError = Pipe()
+        try process.run()
+        let data = out.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        // 44 = errSecItemNotFound as the tool reports it; anything else non-zero, let the direct read try.
+        guard process.terminationStatus == 0 else { return nil }
+        let trimmed = Data(String(decoding: data, as: UTF8.self)
+            .trimmingCharacters(in: .whitespacesAndNewlines).utf8)
+        guard !trimmed.isEmpty else { return nil }
+        return try parse(trimmed, source: "Keychain via security (\(service))")
+    }
 
     private static func readKeychain() throws -> Credential? {
         let query: [String: Any] = [

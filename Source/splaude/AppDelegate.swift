@@ -33,6 +33,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var isRecording = false
     private var status = "Idle"
 
+    /// Set while a take is waiting on a credential read that may be showing a
+    /// login-password dialog. No second take starts while it is up.
+    private var isUnlocking = false
+    /// Whether the hotkey came back up during that wait, which is the normal
+    /// case — you cannot hold a key and type a password at once.
+    private var releasedWhileUnlocking = false
+
     // MARK: - Lifecycle
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -121,7 +128,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// Tap latches; hold dictates for as long as the key is down.
     private func engage() {
-        if isRecording {
+        if isUnlocking {
+            // A second press while the password dialog is up is the only way
+            // out of a take nobody wants to finish authorising.
+            cancelUnlock()
+        } else if isRecording {
             // A second tap while latched ends the take.
             stopRecording()
         } else {
@@ -130,6 +141,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func release(wasHold: Bool) {
+        if isUnlocking {
+            // This release belongs to a take that does not exist yet: the key
+            // went up while the credential was still being unlocked. Remember
+            // it, but do not let it cancel the take it was meant to start —
+            // that is the bug where the mic appeared for an instant after the
+            // password went in and had to be opened all over again.
+            releasedWhileUnlocking = true
+            return
+        }
         guard wasHold, isRecording else { return }
         stopRecording()
     }
@@ -137,20 +157,62 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Recording
 
     private func startRecording() {
-        guard !isRecording else { return }
+        guard !isRecording, !isUnlocking else { return }
 
-        let credential: TokenStore.Credential
-        do {
-            credential = try TokenStore.load()
-            guard !credential.isExpired else { throw TokenStore.TokenError.expired }
-        } catch {
-            abort(error.localizedDescription)
-            // The take just failed on the credential, so the menu should say so
-            // rather than waiting for the next poll.
-            refreshCredentialHealth()
+        // The common case: a token is already in hand, no dialog is possible,
+        // and the take starts on this turn of the run loop.
+        if let credential = TokenStore.unpromptedCredential() {
+            openMic(with: credential)
             return
         }
 
+        // Otherwise the Keychain has to be asked, and reading another app's
+        // credential item can put up a login-password dialog. Asking inline
+        // blocked the main thread until that dialog was answered, and the
+        // hotkey release queued up behind it — so the take arrived and was
+        // cancelled in the same instant the password went in. Ask off the main
+        // thread instead, and let the take latch when the token lands.
+        isUnlocking = true
+        releasedWhileUnlocking = false
+        status = "Unlocking credential…"
+        buildMenu()
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let outcome = Result { try TokenStore.load() }
+
+            DispatchQueue.main.async {
+                // Cancelled, or superseded — the dialog can sit there for as
+                // long as it takes someone to find their password.
+                guard let self, self.isUnlocking else { return }
+                self.isUnlocking = false
+
+                switch outcome {
+                case .success(let credential) where !credential.isExpired:
+                    if self.releasedWhileUnlocking {
+                        Diagnostic.log("credential", "unlocked after the hotkey came up — latching the take instead of dropping it")
+                    }
+                    self.openMic(with: credential)
+                case .success:
+                    // Read fine, but already dead — Claude Code is the only
+                    // thing that can renew it.
+                    self.abort(TokenStore.TokenError.expired.localizedDescription)
+                    self.refreshCredentialHealth()
+
+                case .failure(let error):
+                    self.abort(error.localizedDescription)
+                    // The take just failed on the credential, so the menu should
+                    // say so rather than waiting for the next poll.
+                    self.refreshCredentialHealth()
+                }
+            }
+        }
+    }
+
+    /// Pulls up the microphone permission and opens the take. Split out of
+    /// `startRecording` because the credential can arrive on either of two
+    /// paths — already cached, or after a Keychain prompt — and everything from
+    /// here on is identical.
+    private func openMic(with credential: TokenStore.Credential) {
         capture.requestPermission { [weak self] granted in
             guard let self else { return }
             guard granted else {
@@ -159,6 +221,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             self.openStream(with: credential)
         }
+    }
+
+    /// Abandons a pending unlock. The dialog it put up is securityd's, so it
+    /// stays on screen — answering it just hands back a token nobody uses.
+    private func cancelUnlock() {
+        isUnlocking = false
+        releasedWhileUnlocking = false
+        status = "Idle"
+        buildMenu()
+        render(level: 0)
     }
 
     private func openStream(with credential: TokenStore.Credential) {

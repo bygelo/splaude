@@ -708,6 +708,8 @@ fn run() -> Result<()> {
                         // the floating button as well as the tray, and setting
                         // it in one place is what stops the two disagreeing.
                         wear(status.as_mut(), floating.as_ref(), tray::Mood::Idle);
+                        // Linux has no tray, so no `status` to update.
+                        #[cfg(not(target_os = "linux"))]
                         if let Some(shown) = status.as_mut() {
                             // The harvest ran for this take, so the resolved
                             // project is fresh and free to read here.

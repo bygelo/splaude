@@ -1038,6 +1038,8 @@ mod test {
 
         let found = active_within(&root, SystemTime::now()).unwrap();
         assert_eq!(found.name, "sisia_app");
+        // On Windows a `/Users/…` path is a Mac's, and `local_root` re-homes it.
+        #[cfg(not(windows))]
         assert_eq!(
             found.root,
             PathBuf::from("/Users/someone/Antigravity/sisia_app")

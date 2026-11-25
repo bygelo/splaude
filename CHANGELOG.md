@@ -6,6 +6,8 @@ Notable changes to splaude. Format follows
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-11-26
+
 ### Added
 
 - **`splaude transcribe` — subtitles and a timed transcript from a video.**

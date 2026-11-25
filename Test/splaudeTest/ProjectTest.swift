@@ -131,6 +131,39 @@ final class ProjectTest: XCTestCase {
         XCTAssertEqual(found.root.path, "/Users/someone/Antigravity/sisia_app")
     }
 
+    func testASessionSyncedFromWindowsResolvesToTheRepoName() throws {
+        // On 2026-11-25 a session synced from a Windows machine recorded
+        // `C:\Users\maran\Code\bygelo@main`, and the whole string became the
+        // project name, with a root that does not exist here.
+        let project = scratch.appendingPathComponent("-Users-someone-Code-bygelo")
+        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+        try "{\"cwd\":\"C:\\\\Users\\\\maran\\\\Code\\\\bygelo@main\"}\n"
+            .write(to: project.appendingPathComponent("a.jsonl"), atomically: true, encoding: .utf8)
+
+        let found = try XCTUnwrap(Project.activeWithin(scratch, now: Date()))
+        XCTAssertEqual(found.name, "bygelo")
+        XCTAssertFalse(found.root.path.contains("\\"))
+    }
+
+    func testAForeignCwdIsFoundThroughTheSessionDirectoryName() throws {
+        // The encoding maps `/` to `-`, so the fixture path must hold no dashes of its own.
+        let holder = FileManager.default.temporaryDirectory
+            .appendingPathComponent("splaude\(UUID().uuidString.replacingOccurrences(of: "-", with: ""))")
+        defer { try? FileManager.default.removeItem(at: holder) }
+        let local = holder.appendingPathComponent("Code/bygelo")
+        try FileManager.default.createDirectory(at: local, withIntermediateDirectories: true)
+        let encoded = local.path.replacingOccurrences(of: "/", with: "-")
+        let root = Project.localRoot(
+            "C:\\Users\\maran\\Code\\bygelo@main",
+            sessionDirectory: URL(fileURLWithPath: "/sessions").appendingPathComponent(encoded))
+        XCTAssertEqual(root.resolvingSymlinksInPath().path, local.resolvingSymlinksInPath().path)
+    }
+
+    func testAPosixCwdIsLeftAsRecorded() {
+        let root = Project.localRoot("/x/blead", sessionDirectory: URL(fileURLWithPath: "/s/-x-blead"))
+        XCTAssertEqual(root.path, "/x/blead")
+    }
+
     func testIgnoresASessionOlderThanTheStalenessBound() throws {
         let project = scratch.appendingPathComponent("-old")
         try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)

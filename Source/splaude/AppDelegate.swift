@@ -21,9 +21,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var hasNotedDrift = false
     /// Return sent the message: the field is empty now, so nothing more of this take may be typed.
     private var hasSubmitted = false
-    /// The user typed into the field mid-take: the typer's picture of the screen is wrong now,
-    /// so it stops, and the part not yet typed goes to the clipboard instead of over their text.
+    /// The user is typing into the field mid-take: the typer's picture of the screen is wrong,
+    /// so it pauses. Once they stop for `resumeDelay` it starts a fresh segment at the cursor
+    /// and keeps typing the words not yet on screen — never backspacing into what came before.
+    /// Until 2026-11-25 the rest of the take went to the clipboard instead, and had to be pasted.
     private var userTookOver = false
+    /// Spoken words already handed to earlier segments; the current segment types the rest.
+    private var segmentBase = 0
+    private var resumeTimer: Timer?
+    /// The latest committed + interim text, what a resumed segment catches up to.
+    private var lastDisplay = ""
+    private static let resumeDelay: TimeInterval = 0.9
 
     private var backend: (any SpeechBackend)?
     private var transcript = TranscriptBuffer()
@@ -262,6 +270,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         hasNotedDrift = false
         hasSubmitted = false
         userTookOver = false
+        segmentBase = 0
+        lastDisplay = ""
+        resumeTimer?.invalidate()
+        resumeTimer = nil
         watchForSubmit()
 
         // The bundle identifier is in here for one reason: a remote client the
@@ -358,16 +370,61 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if !isSubmit, key == Int(Setting.hotkeyCode) { return }
 
             guard let self, self.isRecording, !self.hasSubmitted else { return }
-            if self.isTypingLive { self.typer.halt() }
             if isSubmit, Setting.stopOnReturn {
+                if self.isTypingLive { self.typer.halt() }
                 self.hasSubmitted = true
                 Diagnostic.log("submit", "Return pressed — ending the take, typing stopped")
                 self.stopRecording()
-            } else if self.isTypingLive, !self.userTookOver {
-                self.userTookOver = true
-                Diagnostic.log("type", "user typed mid-take (key \(key)) — live typing stopped, the rest goes to the clipboard")
+                return
             }
+            // A global monitor sees keys typed in *any* app. Keys typed while the anchored
+            // field is not focused (the take is already holding its text) never touched it:
+            // three of the twelve takeovers logged on 2026-11-25 were exactly that.
+            guard self.isTypingLive, self.canTypeNow else { return }
+            self.typer.halt()
+            if !self.userTookOver {
+                self.userTookOver = true
+                Diagnostic.log("type", "user typed mid-take (key \(key)) — paused until they stop")
+            }
+            self.scheduleResume()
         }
+    }
+
+    /// Restarted by every user key, so the typer waits for a real pause.
+    private func scheduleResume() {
+        resumeTimer?.invalidate()
+        resumeTimer = Timer.scheduledTimer(withTimeInterval: Self.resumeDelay, repeats: false) { [weak self] _ in
+            self?.resumeAfterUser()
+        }
+    }
+
+    /// Starts a new segment at the cursor. What the halted typer put on screen is
+    /// counted as handed over; the user may have edited it, so it is never touched again.
+    private func resumeAfterUser() {
+        resumeTimer = nil
+        guard isRecording, isTypingLive, userTookOver, !hasSubmitted else { return }
+        segmentBase += wordCount(typer.snapshot())
+        typer.reset()
+        userTookOver = false
+        Diagnostic.log("type", "user paused — typing resumes after word \(segmentBase)")
+        guard canTypeNow else { noteDrift(); return }
+        typer.update(to: segmentTail(lastDisplay))
+    }
+
+    private func wordCount(_ text: String) -> Int {
+        text.split(whereSeparator: \.isWhitespace).count
+    }
+
+    /// The part of the transcript the current segment owns: every word past `segmentBase`,
+    /// led by a space so it does not fuse with the word before the cursor.
+    ///
+    /// Counted in words, not characters: a revision that respells a word already handed
+    /// over ("want" → "wanted") leaves the word count where it was, so the boundary holds.
+    private func segmentTail(_ text: String) -> String {
+        guard segmentBase > 0 else { return text }
+        let word = text.split(whereSeparator: \.isWhitespace)
+        guard word.count > segmentBase else { return "" }
+        return " " + word[segmentBase...].joined(separator: " ")
     }
 
     private func unwatchSubmit() {
@@ -664,6 +721,7 @@ extension AppDelegate: SpeechBackendDelegate {
             guard let self, self.isCurrent(sender, "transcript") else { return }
 
             let display = self.transcript.apply(text, isFinal: isFinal)
+            self.lastDisplay = display
             self.statusItem.button?.toolTip = display
 
             // Live mode reconciles on every frame, interim included — that is
@@ -682,7 +740,7 @@ extension AppDelegate: SpeechBackendDelegate {
                     return
                 }
 
-                self.typer.update(to: display)
+                self.typer.update(to: self.segmentTail(display))
                 if isFinal { self.typer.lock() }
                 return
             }
@@ -722,8 +780,16 @@ extension AppDelegate: SpeechBackendDelegate {
                 // Usually already on screen, typed as it was spoken — but
                 // anything held back while focus was away never got there, and
                 // ending the take is the last chance to place it.
-                let onScreen = self.typer.text
-                let spoken = self.transcript.committed
+                self.resumeTimer?.invalidate()
+                self.resumeTimer = nil
+                if self.userTookOver {
+                    // Still paused when the take ended: hand over what the halted typer
+                    // reached, exactly as a resume would, and paste the rest below.
+                    self.segmentBase += self.wordCount(self.typer.snapshot())
+                    self.typer.reset()
+                }
+                let onScreen = self.userTookOver ? "" : self.typer.snapshot()
+                let spoken = self.segmentTail(self.transcript.committed)
 
                 let held: String
                 if self.hasSubmitted {
@@ -732,13 +798,9 @@ extension AppDelegate: SpeechBackendDelegate {
                     held = ""
                     if spoken != onScreen { Diagnostic.log("submit", "\(spoken.count - onScreen.count) chars of late transcript not typed after Return") }
                 } else if self.userTookOver {
-                    held = ""
-                    let rest = spoken.hasPrefix(onScreen) ? String(spoken.dropFirst(onScreen.count)) : spoken
-                    if !rest.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                        NSPasteboard.general.clearContents()
-                        NSPasteboard.general.setString(rest.trimmingCharacters(in: .whitespaces), forType: .string)
-                        Diagnostic.log("type", "\(rest.count) chars not typed because the user typed — on the clipboard")
-                        self.status = "You typed — rest of the take is on the clipboard"
+                    held = spoken
+                    if !held.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        Diagnostic.log("type", "take ended while the user was typing — pasting the last \(held.count) chars at the cursor")
                     }
                 } else if spoken.hasPrefix(onScreen) {
                     held = String(spoken.dropFirst(onScreen.count))

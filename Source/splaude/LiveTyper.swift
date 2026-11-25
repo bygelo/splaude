@@ -42,6 +42,8 @@ final class LiveTyper {
 
     var isEmpty: Bool { typed.isEmpty }
     var text: String { typed }
+    /// `text`, read on the typer's own queue so a burst in flight cannot tear it.
+    func snapshot() -> String { queue.sync { typed } }
 
     /// Stops typing now, mid-burst included. Lasts until `reset()`.
     func halt() {
@@ -95,22 +97,32 @@ final class LiveTyper {
 
             guard let source = CGEventSource(stateID: .combinedSessionState) else { return }
 
-            if removeCount > 0 { self.backspace(removeCount, source: source) }
-            if !addition.isEmpty { self.type(addition, source: source) }
-
-            self.typed = String(desired[0..<min(boundary, desired.count)]) + addition
+            // Record what actually reached the screen, not what was intended: a halt
+            // mid-burst leaves part of it unposted, and the next segment counts from here.
+            let deleted = removeCount > 0 ? self.backspace(removeCount, source: source) : 0
+            guard deleted == removeCount else {
+                self.typed = String(current[0..<(current.count - deleted)])
+                return
+            }
+            let base = String(desired[0..<min(boundary, desired.count)])
+            let posted = addition.isEmpty ? 0 : self.type(addition, source: source)
+            let unit = Array(addition.utf16)
+            self.typed = base + (posted >= unit.count
+                ? addition
+                : String(decoding: unit[0..<posted], as: UTF16.self))
         }
     }
 
     // MARK: - Synthetic keys
 
-    private func backspace(_ count: Int, source: CGEventSource) {
+    /// Returns how many backspaces were posted before a halt.
+    private func backspace(_ count: Int, source: CGEventSource) -> Int {
         let delete: CGKeyCode = 51  // kVK_Delete
 
-        for _ in 0..<count {
-            guard !isHalted else { return }
+        for done in 0..<count {
+            guard !isHalted else { return done }
             guard let down = CGEvent(keyboardEventSource: source, virtualKey: delete, keyDown: true),
-                  let up = CGEvent(keyboardEventSource: source, virtualKey: delete, keyDown: false) else { return }
+                  let up = CGEvent(keyboardEventSource: source, virtualKey: delete, keyDown: false) else { return done }
 
             // Push-to-talk means Option is very likely physically held right
             // now, and Option-Delete deletes a whole word. Clear the hardware
@@ -124,19 +136,21 @@ final class LiveTyper {
             up.post(tap: .cgAnnotatedSessionEventTap)
             usleep(useconds_t(Setting.typingInterval))
         }
+        return count
     }
 
-    private func type(_ text: String, source: CGEventSource) {
+    /// Returns how many UTF-16 units were posted before a halt.
+    private func type(_ text: String, source: CGEventSource) -> Int {
         let unit = Array(text.utf16)
         var index = 0
 
         while index < unit.count {
-            guard !isHalted else { return }
+            guard !isHalted else { return index }
             let end = min(index + Self.chunkSize, unit.count)
             var chunk = Array(unit[index..<end])
 
             guard let down = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: true),
-                  let up = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: false) else { return }
+                  let up = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: false) else { return index }
 
             // Unicode payload bypasses keycode translation, so the text lands
             // verbatim regardless of layout — and flags are cleared so a held
@@ -154,5 +168,6 @@ final class LiveTyper {
 
             index = end
         }
+        return index
     }
 }

@@ -219,11 +219,49 @@ enum Project {
             // payloads and tool results, where it may name a subdirectory the
             // session merely touched rather than the project root.
             if let cwd = entry["cwd"] as? String, !cwd.isEmpty {
-                return URL(fileURLWithPath: cwd)
+                return localRoot(cwd, sessionDirectory: path.deletingLastPathComponent())
             }
         }
 
         return nil
+    }
+
+    /// A recorded `cwd` as a directory on *this* machine.
+    ///
+    /// Sessions synced from another machine keep that machine's `cwd`: on
+    /// 2026-11-25 the newest session under `-Users-…-Code-bygelo` said
+    /// `C:\Users\maran\Code\bygelo@main`. Read as a POSIX path its last
+    /// component is the whole string, so the "project" became that string,
+    /// the root did not exist, the README vocabulary came back empty, and five
+    /// Windows path fragments went on the wire instead of `bygelo`.
+    ///
+    /// A foreign path is cut to its last component (either separator) with any
+    /// `@branch` suffix dropped, then found locally: first by decoding the
+    /// session directory's own name, which Claude Code wrote from the local
+    /// path, then under `~/Code`. Failing both, the name alone survives.
+    static func localRoot(_ raw: String, sessionDirectory: URL) -> URL {
+        let isForeign = raw.contains("\\") || raw.range(of: "^[A-Za-z]:", options: .regularExpression) != nil
+        guard isForeign else { return URL(fileURLWithPath: raw) }
+
+        var base = raw.split(whereSeparator: { $0 == "\\" || $0 == "/" }).last.map(String.init) ?? raw
+        if let at = base.firstIndex(of: "@"), at != base.startIndex { base = String(base[..<at]) }
+
+        let manager = FileManager.default
+        var isDirectory: ObjCBool = false
+        let encoded = sessionDirectory.lastPathComponent
+        if encoded.hasSuffix("-" + base) {
+            let parent = String(encoded.dropLast(base.count)).replacingOccurrences(of: "-", with: "/")
+            let candidate = URL(fileURLWithPath: parent + base)
+            if manager.fileExists(atPath: candidate.path, isDirectory: &isDirectory), isDirectory.boolValue {
+                return candidate
+            }
+        }
+        let code = manager.homeDirectoryForCurrentUser.appendingPathComponent("Code/\(base)")
+        if manager.fileExists(atPath: code.path, isDirectory: &isDirectory), isDirectory.boolValue {
+            return code
+        }
+        // Nothing local: keep the name, which is still the right bias.
+        return URL(fileURLWithPath: "/").appendingPathComponent(base)
     }
 
     // MARK: - Harvest

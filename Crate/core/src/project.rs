@@ -223,11 +223,70 @@ fn read_cwd(path: &Path) -> Option<PathBuf> {
         // payloads and tool results, where it may name a subdirectory the
         // session merely touched rather than the project root.
         if let Some(cwd) = entry.get("cwd").and_then(|value| value.as_str()) {
-            return Some(PathBuf::from(cwd));
+            if cwd.is_empty() {
+                continue;
+            }
+            return Some(local_root(cwd, path.parent()?));
         }
     }
 
     None
+}
+
+/// Whether a recorded `cwd` was written on a machine of the other family.
+fn is_foreign(raw: &str) -> bool {
+    let bytes = raw.as_bytes();
+    let has_drive = bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
+    if cfg!(windows) {
+        raw.starts_with('/') && !has_drive
+    } else {
+        raw.contains('\\') || has_drive
+    }
+}
+
+/// A recorded `cwd` as a directory on *this* machine.
+///
+/// Sessions synced between machines keep the writer's `cwd`: on 2026-11-25 a
+/// Mac session directory held `C:\Users\maran\Code\bygelo@main`, whose last
+/// POSIX component is the whole string, so the project name went on the wire
+/// as a Windows path and the README vocabulary came back empty. A foreign path
+/// is cut to its last component (either separator), any `@branch` suffix is
+/// dropped, and the repo is looked for locally: by decoding the session
+/// directory's own name (Unix encoding only), then under `~/Code`. Failing
+/// both, the name alone survives, which is still the right bias.
+pub fn local_root(raw: &str, session_directory: &Path) -> PathBuf {
+    if !is_foreign(raw) {
+        return PathBuf::from(raw);
+    }
+
+    let mut base = raw
+        .split(['\\', '/'])
+        .rfind(|part| !part.is_empty())
+        .unwrap_or(raw)
+        .to_string();
+    if let Some(at) = base.find('@') {
+        if at > 0 {
+            base.truncate(at);
+        }
+    }
+
+    if !cfg!(windows) {
+        if let Some(encoded) = session_directory.file_name().and_then(|value| value.to_str()) {
+            if let Some(parent) = encoded.strip_suffix(&format!("-{base}")) {
+                let candidate = PathBuf::from(format!("{}/{base}", parent.replace('-', "/")));
+                if candidate.is_dir() {
+                    return candidate;
+                }
+            }
+        }
+    }
+    if let Some(home) = dirs::home_dir() {
+        let candidate = home.join("Code").join(&base);
+        if candidate.is_dir() {
+            return candidate;
+        }
+    }
+    PathBuf::from("/").join(base)
 }
 
 /// How many recent project names may spend budget. Twenty covers about a week
@@ -931,6 +990,33 @@ mod test {
         assert!(!term.iter().any(|value| value == "node_modules"));
 
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn a_session_synced_from_windows_resolves_to_the_repo_name() {
+        let root = std::env::temp_dir().join("splaude-foreign-session-test");
+        let _ = fs::remove_dir_all(&root);
+        let project = root.join("-Users-someone-Code-bygelonotlocal");
+        fs::create_dir_all(&project).unwrap();
+        fs::write(
+            project.join("a.jsonl"),
+            "{\"cwd\":\"C:\\\\Users\\\\maran\\\\Code\\\\bygelonotlocal@main\"}\n",
+        )
+        .unwrap();
+
+        let found = active_within(&root, SystemTime::now()).unwrap();
+        assert_eq!(found.name, "bygelonotlocal");
+        assert!(!found.root.to_string_lossy().contains('\\'));
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_session_synced_from_a_mac_keeps_the_repo_name() {
+        let root = local_root("/Users/someone/Code/bygelonotlocal", Path::new("C:\\s\\x"));
+        assert_eq!(root.file_name().unwrap(), "bygelonotlocal");
     }
 
     #[test]

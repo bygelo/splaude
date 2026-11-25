@@ -216,10 +216,12 @@ put the last ten or so words into the next message, and a revision backspaced
 into whatever had replaced them. So the moment Return is seen the typer halts,
 mid-burst included, and the late tail is dropped. The same monitor sees your
 own keys during a take (splaude tags its synthetic events with
-`eventSourceUserData`, so it never mistakes itself for you): the first one
-stops live typing for the rest of the take, and what was not yet typed goes to
-the clipboard instead of being backspaced into your text. ⌘C, ⌘Tab and the
-hotkey do not count; ⌘V, ⌘X and ⌘Z do.
+`eventSourceUserData`, so it never mistakes itself for you): one pauses live
+typing, and once you have stopped for 0.9 s it resumes at the cursor with the
+words not yet on screen, never backspacing into anything from before the pause.
+If the take ends while you are still typing, the rest is pasted. Keys typed in
+another app while the field is unfocused do not count, nor do ⌘C, ⌘Tab and the
+hotkey; ⌘V, ⌘X and ⌘Z do. Resuming lands wherever your cursor is.
 
 **A silent take says so.** A take that sent audio but never rose above a peak
 of 0.01 and produced no words reads "No sound from the mic — check Sound ›

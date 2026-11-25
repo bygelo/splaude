@@ -8,6 +8,22 @@ Notable changes to splaude. Format follows
 
 ### Fixed
 
+- **Typing into the field mid-take pauses live typing instead of ending it.**
+  Any key used to stop the typer for the rest of the take and put the untyped
+  remainder on the clipboard — 12 takes on 2026-11-25, 8 of them on Backspace.
+  The typer now waits until you have stopped for 0.9 s, then starts a fresh
+  segment at the cursor with the words not yet on screen, never backspacing
+  into text from before the pause. A take that ends while you are still typing
+  pastes its remainder automatically. Keys typed in another app while the
+  anchored field is unfocused no longer count (3 of the 12). A halted burst now
+  records only the characters it actually posted.
+- **Sessions synced from another machine no longer poison the project bias.**
+  A session recording `C:\Users\maran\Code\bygelo@main` made that whole string
+  the project name, with a root that does not exist, so the README vocabulary
+  came back empty and Windows paths went on the wire instead of `bygelo`, `tna`
+  and `college` (654 → 492 of 1024 characters once fixed). A foreign `cwd` is
+  cut to its repo name, `@branch` dropped, and found locally through the session
+  directory's name or `~/Code`. Same fix in the Rust port, both directions.
 - **A take started right after another one is no longer killed by the old one's close.**
   A take's close arrives up to 3 s after you stop it. A hotkey press in that gap
   started the next take, and the old close then cleared the current backend,
@@ -19,7 +35,7 @@ Notable changes to splaude. Format follows
   Return; the typer still diffed against the text it believed was on screen
   and typed the tail into the emptied box. It now halts the moment Return or a
   user key is seen (its own keys are tagged and ignored), drops the late tail
-  after a submit, and puts the untyped rest on the clipboard when you typed.
+  after a submit, and (superseded below) resumes once you stop typing.
 - **A silent take reports a muted input** ("No sound from the mic — check
   Sound › Input") instead of finishing as an empty take.
 

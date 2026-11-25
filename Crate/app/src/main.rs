@@ -1611,6 +1611,7 @@ fn mark(yes: bool) -> &'static str {
 /// Resolution is skipped entirely when the setting is off: reading someone's
 /// session log to label a menu item they have switched off is work they did not
 /// ask for.
+#[cfg(not(target_os = "linux"))]
 fn project_name(setting: &Setting) -> Option<String> {
     if !setting.use_project_keyterm {
         return None;

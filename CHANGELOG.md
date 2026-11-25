@@ -8,6 +8,12 @@ Notable changes to splaude. Format follows
 
 ### Fixed
 
+- **A take started right after another one is no longer killed by the old one's close.**
+  A take's close arrives up to 3 s after you stop it. A hotkey press in that gap
+  started the next take, and the old close then cleared the current backend,
+  stopped the new take's mic and left its socket open for 12 minutes (2026-11-25
+  15:24:20). Every speech callback now names its backend, and the app ignores one
+  that is not the current take (`[take] ignored … from a finished take` in the log).
 - **The last words no longer type twice after Return, and live typing never
   backspaces over your own text.** The final transcript arrives ~0.3 s after
   Return; the typer still diffed against the text it believed was on screen

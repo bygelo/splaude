@@ -303,21 +303,21 @@ enum Benchmark {
             return buffer.committed
         }
 
-        func speechDidOpen() { opened.signal() }
+        func speechDidOpen(_ backend: SpeechBackend) { opened.signal() }
 
-        func speechDidTranscribe(_ text: String, isFinal: Bool) {
+        func speechDidTranscribe(_ backend: SpeechBackend, _ text: String, isFinal: Bool) {
             guard isFinal else { return }
             lock.lock()
             buffer.apply(text, isFinal: true)
             lock.unlock()
         }
 
-        func speechDidFail(_ message: String, fatal: Bool) {
+        func speechDidFail(_ backend: SpeechBackend, _ message: String, fatal: Bool) {
             print("  \(fatal ? "fatal" : "warning"): \(message)")
             if fatal { opened.signal() }
         }
 
-        func speechDidClose() {
+        func speechDidClose(_ backend: SpeechBackend) {
             opened.signal()
             closed.signal()
         }

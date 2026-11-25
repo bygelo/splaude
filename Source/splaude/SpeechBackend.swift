@@ -22,12 +22,15 @@ struct SpeechAudioFormat {
     static let linear16_16k = SpeechAudioFormat(sampleRate: 16000, channelCount: 1)
 }
 
+/// Every callback names the backend it came from. A take that is finishing still reports
+/// (its close lands up to `closeGrace` later), and by then the next take may already be
+/// running; without the sender the app cannot tell the two apart.
 protocol SpeechBackendDelegate: AnyObject {
-    func speechDidOpen()
+    func speechDidOpen(_ backend: SpeechBackend)
     /// `isFinal` marks an utterance boundary — the text is committed at that point.
-    func speechDidTranscribe(_ text: String, isFinal: Bool)
-    func speechDidFail(_ message: String, fatal: Bool)
-    func speechDidClose()
+    func speechDidTranscribe(_ backend: SpeechBackend, _ text: String, isFinal: Bool)
+    func speechDidFail(_ backend: SpeechBackend, _ message: String, fatal: Bool)
+    func speechDidClose(_ backend: SpeechBackend)
 }
 
 /// Mirrors the extension's committed/interim bookkeeping: finals accumulate

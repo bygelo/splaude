@@ -639,17 +639,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
 extension AppDelegate: SpeechBackendDelegate {
 
-    func speechDidOpen() {
+    /// Whether a callback belongs to the take now running. A finished take's close arrives
+    /// up to `closeGrace` after its stop, and a hotkey press in that gap has already started
+    /// the next take: on 2026-11-25 15:24:20 the old take's close ran 0.23 s into the new one,
+    /// set `backend` to nil, stopped its mic and left its socket open for 12 minutes. A stale
+    /// sender's state (transcript, typer, anchor) was already reset by the new take, so there
+    /// is nothing of it left to deliver: drop the callback.
+    private func isCurrent(_ sender: SpeechBackend, _ what: String) -> Bool {
+        if sender === backend { return true }
+        Diagnostic.log("take", "ignored \(what) from a finished take")
+        return false
+    }
+
+    func speechDidOpen(_ sender: SpeechBackend) {
         DispatchQueue.main.async { [weak self] in
-            guard let self, self.isRecording else { return }
+            guard let self, self.isCurrent(sender, "open"), self.isRecording else { return }
             self.status = "Listening"
             self.buildMenu()
         }
     }
 
-    func speechDidTranscribe(_ text: String, isFinal: Bool) {
+    func speechDidTranscribe(_ sender: SpeechBackend, _ text: String, isFinal: Bool) {
         DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
+            guard let self, self.isCurrent(sender, "transcript") else { return }
 
             let display = self.transcript.apply(text, isFinal: isFinal)
             self.statusItem.button?.toolTip = display
@@ -683,10 +695,10 @@ extension AppDelegate: SpeechBackendDelegate {
         }
     }
 
-    func speechDidFail(_ message: String, fatal: Bool) {
+    func speechDidFail(_ sender: SpeechBackend, _ message: String, fatal: Bool) {
         Diagnostic.log("stt", "fail (fatal: \(fatal)): \(message)")
         DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
+            guard let self, self.isCurrent(sender, "failure") else { return }
             if fatal || self.isRecording {
                 self.abort(message)
             } else {
@@ -696,9 +708,9 @@ extension AppDelegate: SpeechBackendDelegate {
         }
     }
 
-    func speechDidClose() {
+    func speechDidClose(_ sender: SpeechBackend) {
         DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
+            guard let self, self.isCurrent(sender, "close") else { return }
 
             self.backend = nil
             self.isRecording = false

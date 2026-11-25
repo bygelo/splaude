@@ -184,7 +184,7 @@ final class AnthropicSpeechBackend: NSObject, SpeechBackend {
         case "TranscriptInterim", "TranscriptText":
             guard let text = frame["data"] as? String, !text.isEmpty else { break }
             pending = text
-            delegate?.speechDidTranscribe(text, isFinal: false)
+            delegate?.speechDidTranscribe(self, text, isFinal: false)
 
         case "TranscriptEndpoint":
             Diagnostic.log("stt", "endpoint — commit \"\(pending)\"")
@@ -209,7 +209,7 @@ final class AnthropicSpeechBackend: NSObject, SpeechBackend {
         guard !pending.isEmpty else { return }
         let text = pending
         pending = ""
-        delegate?.speechDidTranscribe(text, isFinal: true)
+        delegate?.speechDidTranscribe(self, text, isFinal: true)
     }
 
     // MARK: - Lifecycle
@@ -240,11 +240,11 @@ final class AnthropicSpeechBackend: NSObject, SpeechBackend {
         session?.finishTasksAndInvalidate()
         session = nil
 
-        delegate?.speechDidClose()
+        delegate?.speechDidClose(self)
     }
 
     private func fail(_ message: String, fatal: Bool) {
-        delegate?.speechDidFail(message, fatal: fatal)
+        delegate?.speechDidFail(self, message, fatal: fatal)
     }
 
     /// Comma-joined form of `normaliseKeyterm`, for the `x-config-keyterms`
@@ -312,7 +312,7 @@ extension AnthropicSpeechBackend: URLSessionWebSocketDelegate {
         }
 
         Diagnostic.log("socket", "open")
-        delegate?.speechDidOpen()
+        delegate?.speechDidOpen(self)
     }
 
     func urlSession(_ session: URLSession,

@@ -8,6 +8,15 @@ Notable changes to splaude. Format follows
 
 ### Fixed
 
+- **The last words no longer type twice after Return, and live typing never
+  backspaces over your own text.** The final transcript arrives ~0.3 s after
+  Return; the typer still diffed against the text it believed was on screen
+  and typed the tail into the emptied box. It now halts the moment Return or a
+  user key is seen (its own keys are tagged and ignored), drops the late tail
+  after a submit, and puts the untyped rest on the clipboard when you typed.
+- **A silent take reports a muted input** ("No sound from the mic — check
+  Sound › Input") instead of finishing as an empty take.
+
 - The keyterm budget meter counts against the limit the wire actually enforces.
   It showed characters only, and 0.3.0 had already established — by measuring
   the live endpoint, where 93 terms transcribe and 94 fail outright — that the

@@ -210,6 +210,22 @@ so Return still sends whatever you were typing into; it only stops the
 dictation. Turn it off under Dictation when writing prose, where Return is a
 new paragraph rather than a full stop.
 
+**Nothing is typed after Return, or over your own typing.** The final transcript
+lands about 0.3 s after Return, by which time the field is empty: typing it then
+put the last ten or so words into the next message, and a revision backspaced
+into whatever had replaced them. So the moment Return is seen the typer halts,
+mid-burst included, and the late tail is dropped. The same monitor sees your
+own keys during a take (splaude tags its synthetic events with
+`eventSourceUserData`, so it never mistakes itself for you): the first one
+stops live typing for the rest of the take, and what was not yet typed goes to
+the clipboard instead of being backspaced into your text. ⌘C, ⌘Tab and the
+hotkey do not count; ⌘V, ⌘X and ⌘Z do.
+
+**A silent take says so.** A take that sent audio but never rose above a peak
+of 0.01 and produced no words reads "No sound from the mic — check Sound ›
+Input": on 2026-11-24 the Mac's input volume sat at 0 and every take came back
+blank, which looked like a broken hotkey.
+
 Synthetic keystrokes carry a cleared modifier state. Push-to-talk means Option
 is usually physically held while typing happens, and `⌥Delete` deletes a whole
 word.

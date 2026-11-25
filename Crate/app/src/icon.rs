@@ -434,7 +434,9 @@ mod test {
         // readable share of the face there rather than dissolve into it —
         // shrink it and this is the count that drops first.
         let white = render(Mood::Idle, 16)
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .filter(|channel| channel.iter().all(|&value| value > 200))
             .count();
         assert!(white >= 20, "only {white} white pixel at 16px");
@@ -470,9 +472,16 @@ mod test {
             let pixel = render(Mood::Idle, edge);
             assert_eq!(pixel.len(), (edge * edge * 4) as usize);
 
-            let opaque = pixel.chunks_exact(4).filter(|slot| slot[3] == 255).count();
+            let opaque = pixel
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .filter(|slot| slot[3] == 255)
+                .count();
             let white = pixel
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .filter(|slot| slot[3] == 255 && slot[..3].iter().all(|&value| value > 200))
                 .count();
 

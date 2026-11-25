@@ -271,7 +271,10 @@ pub fn local_root(raw: &str, session_directory: &Path) -> PathBuf {
     }
 
     if !cfg!(windows) {
-        if let Some(encoded) = session_directory.file_name().and_then(|value| value.to_str()) {
+        if let Some(encoded) = session_directory
+            .file_name()
+            .and_then(|value| value.to_str())
+        {
             if let Some(parent) = encoded.strip_suffix(&format!("-{base}")) {
                 let candidate = PathBuf::from(format!("{}/{base}", parent.replace('-', "/")));
                 if candidate.is_dir() {

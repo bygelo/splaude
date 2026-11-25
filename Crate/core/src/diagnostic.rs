@@ -96,6 +96,15 @@ pub fn to_file() {
     }
 }
 
+static QUIET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Stop echoing log lines to stderr. For commands whose stderr is the user
+/// interface — `transcribe` prints its own progress there, and a socket's
+/// bookkeeping interleaved with it reads as something going wrong.
+pub fn quiet() {
+    QUIET.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Writes one line to stderr, the recent-line ring, and the log file if one has
 /// been opened with [`to_file`].
 ///
@@ -117,7 +126,9 @@ pub fn log(area: &str, message: impl AsRef<str>) {
         }
     }
 
-    eprintln!("{line}");
+    if !QUIET.load(std::sync::atomic::Ordering::Relaxed) {
+        eprintln!("{line}");
+    }
 
     // Held across the write, so two threads cannot interleave halves of their
     // lines. The old code reopened the file per line and relied on the append

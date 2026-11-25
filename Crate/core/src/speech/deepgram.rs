@@ -78,6 +78,13 @@ impl DeepgramSpeechBackend {
         })
     }
 
+    /// Replaces the bias list the setting would have produced. See
+    /// [`crate::speech::AnthropicSpeechBackend::with_keyterm`].
+    pub fn with_keyterm(mut self, keyterm: Vec<String>) -> Self {
+        self.keyterm = keyterm;
+        self
+    }
+
     fn url(&self) -> String {
         let format = SpeechAudioFormat::LINEAR16_16K;
 

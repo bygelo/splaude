@@ -16,6 +16,7 @@ mod inject;
 #[cfg(not(target_os = "linux"))]
 mod setting_window;
 mod take;
+mod transcribe;
 #[cfg(not(target_os = "linux"))]
 mod tray;
 
@@ -86,6 +87,9 @@ USAGE:
 OPTIONS:
     (none)      Run. Hold the hotkey to dictate, or tap it to latch on.
     --check     Report credential, permission and device state, then exit.
+    transcribe <FILE or URL>
+                Subtitles (SRT/VTT) and a timed transcript from a video or
+                recording. `splaude transcribe --help` for options.
     --settings  Open the settings window on its own, without dictating.
     --toggle    Start or stop a take in the running splaude, then exit.
     --cancel    Discard the take in progress, then exit.
@@ -324,6 +328,7 @@ fn main() -> Result<()> {
         // does nothing, and the log holds a `start` line with nothing after it.
         None => run().inspect_err(|error| diagnostic::log("start", format!("{error:#}"))),
         Some("--check") => check(),
+        Some("transcribe") => transcribe::main(&argument[1..], credential_store()),
 
         // The window on its own, with no hotkey, no microphone and no tray.
         //
@@ -1590,11 +1595,59 @@ fn forward(command: control::Command) -> Result<()> {
 /// Where the Claude Code credential is read from.
 ///
 /// The file is the whole story on Windows and Linux — it is where Claude Code
-/// keeps the token there. macOS additionally has it in the Keychain, which this
-/// build cannot read yet; the file fallback covers most installs, and the Swift
-/// app is what macOS users should run today regardless.
+/// keeps the token there. On macOS Claude Code keeps the live token in the
+/// Keychain and the file, when present at all, is usually a stale copy from an
+/// older install, so the Keychain is asked first.
 fn credential_store() -> Store {
-    Store::file_only()
+    #[cfg(target_os = "macos")]
+    {
+        Store::new(vec![
+            Box::new(KeychainSource),
+            Box::new(splaude_core::credential::FileSource::default()),
+        ])
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Store::file_only()
+    }
+}
+
+/// The Keychain item Claude Code writes, read through `security` rather than
+/// the Security framework.
+///
+/// Claude Code itself reads and writes the item with the `security` tool, so
+/// that tool is already on the item's access list and the read does not
+/// prompt; a process of our own linking the framework would be a new
+/// application asking, and would prompt.
+#[cfg(target_os = "macos")]
+struct KeychainSource;
+
+#[cfg(target_os = "macos")]
+impl splaude_core::CredentialSource for KeychainSource {
+    fn name(&self) -> String {
+        format!("macOS Keychain ({})", splaude_core::credential::SERVICE)
+    }
+
+    fn read(&self) -> Result<Option<Vec<u8>>, splaude_core::CredentialError> {
+        let output = std::process::Command::new("/usr/bin/security")
+            .args([
+                "find-generic-password",
+                "-s",
+                splaude_core::credential::SERVICE,
+                "-w",
+            ])
+            .stderr(std::process::Stdio::null())
+            .output()
+            .map_err(|error| splaude_core::CredentialError::Unreadable(error.to_string()))?;
+        if !output.status.success() || output.stdout.is_empty() {
+            return Ok(None);
+        }
+        let mut blob = output.stdout;
+        while blob.last().is_some_and(u8::is_ascii_whitespace) {
+            blob.pop();
+        }
+        Ok(Some(blob))
+    }
 }
 
 fn mark(yes: bool) -> &'static str {

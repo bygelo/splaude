@@ -232,6 +232,55 @@ Synthetic keystrokes carry a cleared modifier state. Push-to-talk means Option
 is usually physically held while typing happens, and `⌥Delete` deletes a whole
 word.
 
+## Transcribe a video
+
+`splaude transcribe` turns a video, a recording or a URL into subtitles and a
+timed transcript, using the same Claude Code sign-in as dictation.
+
+```bash
+splaude transcribe talk.mp4 -c "Interview with Dr. Ngozi Okonkwo about Kubernetes"
+# → talk.srt and talk.txt next to the video
+splaude transcribe talk.mp4 -f all -o out/        # srt, vtt, txt and json
+splaude transcribe "https://youtu.be/…" -f srt   # downloaded with yt-dlp when installed
+```
+
+| Format | What is in it |
+| --- | --- |
+| `srt`, `vtt` | Subtitle cues of at most two lines, broken at sentences and pauses |
+| `txt` | Paragraphs, each stamped `[mm:ss]` |
+| `json` | Every cue and **every word** with `start_ms` / `end_ms` — for editing or cutting |
+
+**Needs `ffmpeg` on PATH** (`brew install ffmpeg`, `winget install ffmpeg`);
+`yt-dlp` too for URLs.
+
+**Context is worth giving.** `-c` takes prose or a list; names, acronyms and
+jargon in it bias recognition (`-t` adds one term, `--context-file` reads a
+file). That is how "Okonkwo" and "Supabase" come back spelled right.
+
+**How long it takes.** The endpoint takes audio at real speed, so the file is
+cut at silences into pieces sent side by side: a 7:26 video took 1:50 with
+`-p 5`, and 1:52 of audio took 40 s. A Claude account gets **5 live speech
+sessions** at once (measured: the 6th is refused with `rate_limit`), so `-p`
+stops at 5 and defaults to 4, leaving one for dictating. If the account is
+already busy the run steps down and retries rather than failing.
+
+**How accurate the timings are.** The endpoint returns text, not timestamps.
+splaude times each word by when it arrived, snaps it to the audio's loudness
+envelope, and moves phrases the server sent late back to the speech they belong
+to. Against hand-timed truth:
+
+| Audio (live runs) | Words matched | Start within 250 ms | End within 250 ms | Worst start |
+| --- | --- | --- | --- | --- |
+| Clean speech, 1:52 (3 runs) | 157 / 167 | 92–94% | 89–92% | 0.6–0.7 s |
+| Same ×4, 7:26, `-p 5` (2 runs) | 637 / 668 | 89–92% | 89–90% | 0.5–0.6 s |
+| Speech under noise (2 runs) | 159 / 167 | 89–93% | 89% | 0.9–1.5 s |
+
+The range is run to run: the server falls behind by different amounts each
+time. When it falls far behind, splaude keeps the session open until the text
+stops changing, so the end of a piece is not lost. Subtitles need no better;
+for frame-accurate cuts, check the edges by ear. Use `--backend deepgram` with your own key for speech other than Claude's
+endpoint.
+
 ## Permission
 
 Three grants, each prompted on first use:

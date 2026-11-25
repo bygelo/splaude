@@ -13,6 +13,7 @@ pub mod quota;
 pub mod replacement;
 pub mod setting;
 pub mod speech;
+pub mod transcribe;
 pub mod typer;
 pub mod update;
 

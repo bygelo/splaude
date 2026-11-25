@@ -111,6 +111,37 @@ impl AnthropicSpeechBackend {
         }
     }
 
+    /// A backend with no bias and plain interims, for callers that are not
+    /// dictating and supply their own terms with [`Self::with_keyterm`].
+    /// Skips the setting's keyterm assembly, which reads the project harvest.
+    pub fn new_bare(credential: Credential, language: &str) -> Self {
+        Self {
+            credential,
+            keyterm: Vec::new(),
+            language: language.to_string(),
+            typed_interim: false,
+            store: None,
+            endpoint: ENDPOINT.to_string(),
+        }
+    }
+
+    /// Replaces the bias list the setting would have produced.
+    ///
+    /// Transcribing a file is not dictating code: the builtin developer terms
+    /// and the harvested project vocabulary are the wrong context for somebody
+    /// else's video, and the caller knows the right one.
+    pub fn with_keyterm(mut self, keyterm: Vec<String>) -> Self {
+        self.keyterm = keyterm;
+        self
+    }
+
+    /// Whether interims are shaped for typing. Off for file transcription,
+    /// where nothing is typed and only the committed text matters.
+    pub fn with_typed_interim(mut self, typed_interim: bool) -> Self {
+        self.typed_interim = typed_interim;
+        self
+    }
+
     /// Lets a rejected credential be evicted from the cache that produced it.
     pub fn with_store(mut self, store: Arc<Store>) -> Self {
         self.store = Some(store);

@@ -6,6 +6,49 @@ Notable changes to splaude. Format follows
 
 ## [Unreleased]
 
+### Added
+
+- **`splaude transcribe` — subtitles and a timed transcript from a video.**
+  A file or URL goes through ffmpeg, is cut at silences into pieces, and the
+  pieces are transcribed side by side over the Claude Code sign-in (or
+  `--backend deepgram`). Writes `srt`, `vtt`, `txt` and `json`, the last with
+  every word timed. `-c` / `-t` / `--context-file` bias recognition towards the
+  names in the recording. A 7:26 video takes 1:50.
+- **Word timings that survive a lagging server.** The endpoint returns no
+  timestamps, and some sessions fall 300–800 ms behind partway through, with
+  sentence ends up to 2.2 s late. Each phrase's lag is now measured against the
+  speech it sits over and taken off before words are snapped to the audio; a
+  phrase whose words still land outside it is spread over it instead. On a
+  7:26 run replayed offline, starts within 250 ms went 71% → 83% and the
+  worst start 2642 → 1932 ms; on clean speech 92% → 94%; noisy audio is left as it was.
+- **Words that arrived in one burst are spread over their phrase.** Inside
+  a phrase, so the stray check passed, but piled against its end: "The old
+  scheduler struggled" all ending at 28.4 s. A phrase holding a word shorter
+  than a fifth of its spoken length is now spread over the phrase (0–0.5
+  swept over four captured runs).
+- **Word ends under background noise.** An end estimate in what the envelope
+  called silence was walked back to the last loud frame, and under noise a
+  word's quiet tail reads as silence: every end came out ~190 ms early, 68–69%
+  within 250 ms. The walk now stops 100 ms past the last speech, and the start
+  is searched from that speech: 89% in both live noisy runs.
+- **A piece the server fell far behind on keeps its last sentences.** One
+  session ran 12 s behind, and the close after a fixed 1.2 s of silence
+  finalised only what had been decoded: two sentences gone, and 234 of 668
+  words more than 3 s off. Silence now keeps flowing until the transcript has
+  been unchanged for 2 s (at most 30 s); the next two runs kept 658 words and
+  matched 637 and 636.
+- **The run respects the account's 5 live speech sessions.** Measured: a 6th
+  is refused with `rate_limit` / close 4029. `-p` stops at 5, defaults to 4,
+  and a refused piece shrinks the run's concurrency and retries.
+
+### Changed
+
+- **The Rust build reads the Claude Code token from the macOS Keychain first.**
+  It was file-only on macOS, where the file is usually a stale copy; the
+  Keychain item is now read through `/usr/bin/security`, the tool Claude Code
+  itself uses, so it does not prompt. The file stays as the fallback.
+  `splaude transcribe` needs this to sign in on a Mac.
+
 ### Fixed
 
 - **Typing into the field mid-take pauses live typing instead of ending it.**

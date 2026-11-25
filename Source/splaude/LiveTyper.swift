@@ -20,6 +20,20 @@ final class LiveTyper {
 
     private let queue = DispatchQueue(label: "com.bygelo.splaude.type")
 
+    /// Set from the main thread the moment the screen stops matching `typed` — the
+    /// message was sent (Return cleared the field) or the user typed into it. Every
+    /// queued update and every key still to be posted checks it, so nothing typed
+    /// after that point lands in the emptied box or backspaces over the user's text.
+    private let gate = NSLock()
+    private var halted = false
+    /// Bumped by `reset()`: an update queued in an earlier take never runs in the next one.
+    private var take = 0
+    private var isHalted: Bool { gate.lock(); defer { gate.unlock() }; return halted }
+    private func isLive(_ t: Int) -> Bool { gate.lock(); defer { gate.unlock() }; return !halted && take == t }
+
+    /// Tags splaude's own synthetic keys, so a keyboard monitor can tell them from the user's.
+    static let mark: Int64 = 0x73706c64  // "spld"
+
     /// Longest run of backspaces to accept before giving up and leaving the
     /// text alone — a runaway diff must never machine-gun the delete key.
     private static let maxRewrite = 240
@@ -29,7 +43,13 @@ final class LiveTyper {
     var isEmpty: Bool { typed.isEmpty }
     var text: String { typed }
 
+    /// Stops typing now, mid-burst included. Lasts until `reset()`.
+    func halt() {
+        gate.lock(); halted = true; gate.unlock()
+    }
+
     func reset() {
+        gate.lock(); halted = false; take += 1; gate.unlock()
         queue.async { [weak self] in
             self?.typed = ""
             self?.locked = 0
@@ -46,8 +66,9 @@ final class LiveTyper {
 
     /// Reconciles the screen with `target`, typing and backspacing the minimum.
     func update(to target: String) {
+        gate.lock(); let t = take; gate.unlock()
         queue.async { [weak self] in
-            guard let self else { return }
+            guard let self, self.isLive(t) else { return }
 
             let current = Array(self.typed)
             let desired = Array(target)
@@ -87,6 +108,7 @@ final class LiveTyper {
         let delete: CGKeyCode = 51  // kVK_Delete
 
         for _ in 0..<count {
+            guard !isHalted else { return }
             guard let down = CGEvent(keyboardEventSource: source, virtualKey: delete, keyDown: true),
                   let up = CGEvent(keyboardEventSource: source, virtualKey: delete, keyDown: false) else { return }
 
@@ -96,6 +118,8 @@ final class LiveTyper {
             down.flags = []
             up.flags = []
 
+            down.setIntegerValueField(.eventSourceUserData, value: Self.mark)
+            up.setIntegerValueField(.eventSourceUserData, value: Self.mark)
             down.post(tap: .cgAnnotatedSessionEventTap)
             up.post(tap: .cgAnnotatedSessionEventTap)
             usleep(useconds_t(Setting.typingInterval))
@@ -107,6 +131,7 @@ final class LiveTyper {
         var index = 0
 
         while index < unit.count {
+            guard !isHalted else { return }
             let end = min(index + Self.chunkSize, unit.count)
             var chunk = Array(unit[index..<end])
 
@@ -121,6 +146,8 @@ final class LiveTyper {
             down.keyboardSetUnicodeString(stringLength: chunk.count, unicodeString: &chunk)
             up.keyboardSetUnicodeString(stringLength: chunk.count, unicodeString: &chunk)
 
+            down.setIntegerValueField(.eventSourceUserData, value: Self.mark)
+            up.setIntegerValueField(.eventSourceUserData, value: Self.mark)
             down.post(tap: .cgAnnotatedSessionEventTap)
             up.post(tap: .cgAnnotatedSessionEventTap)
             usleep(useconds_t(Setting.typingInterval))

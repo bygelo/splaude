@@ -19,6 +19,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var healthTimer: Timer?
     /// Drift is reported once per take; a status update per frame would thrash.
     private var hasNotedDrift = false
+    /// Return sent the message: the field is empty now, so nothing more of this take may be typed.
+    private var hasSubmitted = false
+    /// The user typed into the field mid-take: the typer's picture of the screen is wrong now,
+    /// so it stops, and the part not yet typed goes to the clipboard instead of over their text.
+    private var userTookOver = false
 
     private var backend: (any SpeechBackend)?
     private var transcript = TranscriptBuffer()
@@ -255,6 +260,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // can be held back if the user wanders off mid-sentence.
         anchor = Setting.anchorInput ? FocusAnchor.capture() : nil
         hasNotedDrift = false
+        hasSubmitted = false
+        userTookOver = false
         watchForSubmit()
 
         // The bundle identifier is in here for one reason: a remote client the
@@ -333,19 +340,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// keystroke still reaches the app and sends the message. Swallowing it
     /// would mean pressing Return did nothing but stop dictating, which is the
     /// opposite of what someone hitting Return wants.
+    ///
+    /// The same monitor sees the user's own typing. Either one means the screen no
+    /// longer holds what LiveTyper typed, and a typer that kept going would type the
+    /// late final transcript into the emptied box (the last words, twice) or
+    /// backspace over the user's characters. So the typer halts on the spot.
     private func watchForSubmit() {
-        guard Setting.stopOnReturn, submitMonitor == nil else { return }
+        guard submitMonitor == nil else { return }
 
         submitMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in
-            // LiveTyper posts its characters as a unicode payload on virtual
-            // key 0, so its own output can never look like Return here.
+            // LiveTyper tags every key it posts; those are not the user's.
+            if event.cgEvent?.getIntegerValueField(.eventSourceUserData) == LiveTyper.mark { return }
             let key = Int(event.keyCode)
-            guard key == kVK_Return || key == kVK_ANSI_KeypadEnter else { return }
+            let isSubmit = key == kVK_Return || key == kVK_ANSI_KeypadEnter
+            // A shortcut that does not edit text (⌘C, ⌘Tab) leaves the field as it was.
+            if !isSubmit, event.modifierFlags.contains(.command), ![kVK_ANSI_V, kVK_ANSI_X, kVK_ANSI_Z].contains(key) { return }
+            if !isSubmit, key == Int(Setting.hotkeyCode) { return }
 
-            DispatchQueue.main.async {
-                guard let self, self.isRecording else { return }
-                Diagnostic.log("submit", "Return pressed — ending the take")
+            guard let self, self.isRecording, !self.hasSubmitted else { return }
+            if self.isTypingLive { self.typer.halt() }
+            if isSubmit, Setting.stopOnReturn {
+                self.hasSubmitted = true
+                Diagnostic.log("submit", "Return pressed — ending the take, typing stopped")
                 self.stopRecording()
+            } else if self.isTypingLive, !self.userTookOver {
+                self.userTookOver = true
+                Diagnostic.log("type", "user typed mid-take (key \(key)) — live typing stopped, the rest goes to the clipboard")
             }
         }
     }
@@ -637,6 +657,8 @@ extension AppDelegate: SpeechBackendDelegate {
             // Live mode reconciles on every frame, interim included — that is
             // what makes words appear as you speak and correct themselves.
             if self.isTypingLive {
+                // Return already sent what was on screen, or the user is typing there.
+                guard !self.hasSubmitted, !self.userTookOver else { return }
                 // Holding back is the whole point of the anchor: keystrokes go
                 // wherever focus is when posted, so typing on regardless would
                 // scatter the sentence — and its backspaces — into whatever the
@@ -692,7 +714,21 @@ extension AppDelegate: SpeechBackendDelegate {
                 let spoken = self.transcript.committed
 
                 let held: String
-                if spoken.hasPrefix(onScreen) {
+                if self.hasSubmitted {
+                    // Return sent the message and emptied the field; whatever the
+                    // recogniser revised after that is not typed into the empty box.
+                    held = ""
+                    if spoken != onScreen { Diagnostic.log("submit", "\(spoken.count - onScreen.count) chars of late transcript not typed after Return") }
+                } else if self.userTookOver {
+                    held = ""
+                    let rest = spoken.hasPrefix(onScreen) ? String(spoken.dropFirst(onScreen.count)) : spoken
+                    if !rest.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(rest.trimmingCharacters(in: .whitespaces), forType: .string)
+                        Diagnostic.log("type", "\(rest.count) chars not typed because the user typed — on the clipboard")
+                        self.status = "You typed — rest of the take is on the clipboard"
+                    }
+                } else if spoken.hasPrefix(onScreen) {
                     held = String(spoken.dropFirst(onScreen.count))
                 } else {
                     // A revision rewrote text the typer had already emitted, so
@@ -719,10 +755,18 @@ extension AppDelegate: SpeechBackendDelegate {
 
             self.anchor = nil
             self.hasNotedDrift = false
+            self.hasSubmitted = false
+            self.userTookOver = false
             self.unwatchSubmit()
 
             if ["Finishing…", "Listening", "Connecting…"].contains(self.status) {
                 self.status = wordCount == 0 ? "Idle" : "\(wordCount) words"
+            }
+            // A take that heard nothing at all is a muted input, not a quiet speaker:
+            // on 2026-11-24 the Mac's input volume sat at 0 and every take came back blank.
+            if wordCount == 0, self.capture.lastPeak < 0.01 {
+                Diagnostic.log("audio", "silent take — input volume 0 or the wrong input device")
+                self.status = "No sound from the mic — check Sound › Input"
             }
 
             self.buildMenu()
